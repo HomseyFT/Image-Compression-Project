@@ -9,16 +9,17 @@ JPEG-style pipeline for black-and-white (grayscale) images:
 - Level shift samples by 128
 - Apply 2D DCT on 8x8 blocks (implemented with pure NumPy math)
 - Quantize coefficients with a JPEG-like luminance quantization matrix
-- Store quantized coefficients in a custom NPZ-based format
+- Entropy code with JPEG-style DC/AC symbols plus per-file Huffman tables
+- Pack into a custom ICJ2 container
 - Decompress by reversing the above steps
 
 Usage (CLI):
 
-    # Compress a grayscale image to a custom .npz format
-    python compression.py compress input.png output.npz --quality 50
+    # Compress a grayscale image to the custom ICJ2 container
+    python compression.py compress input.png output.icj --quality 50
 
-    # Decompress from .npz back to a PNG image
-    python compression.py decompress input.npz output.png
+    # Decompress from ICJ2 back to a PNG image
+    python compression.py decompress input.icj output.png
 
 You can also use the `compress_array` and `decompress_to_array` functions
 programmatically for in-memory use.
@@ -27,11 +28,22 @@ programmatically for in-memory use.
 from __future__ import annotations
 
 import argparse
+import heapq
 from dataclasses import dataclass
 from typing import Tuple
 
 import numpy as np
 from PIL import Image
+
+
+# Container magic. ICJ2 supersedes the original ICJ1 layout; no backwards
+# compatibility is provided, as ICJ1 files could encode an unclamped quality
+# byte that decoded against the wrong quantization matrix.
+MAGIC = b"ICJ2"
+
+# Maximum Huffman code length the container can represent. Codes are stored
+# in a 4-byte field and the decoder scans lengths 1..MAX_CODE_LENGTH.
+MAX_CODE_LENGTH = 32
 
 
 BLOCK_SIZE = 8
@@ -148,33 +160,75 @@ class CompressedImage:
     quality: int
 
 
-# Cache for DCT bases keyed by block size
-_DCT_CACHE: dict[int, np.ndarray] = {}
+# Working precision for the transform. float32 is ~2.7x faster than float64
+# here and perturbs only ~0.007% of quantized coefficients by +/-1 (rounding
+# ties), which is far below the quantization step and invisible in the
+# reconstruction. See SPEC.md phase 3.
+DCT_DTYPE = np.float32
+
+# Cache for DCT bases keyed by block size, holding (D, D.T).
+_DCT_CACHE: dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
 
-def _get_dct_matrix(n: int = BLOCK_SIZE) -> np.ndarray:
-    """Return the orthonormal 1D DCT (type-II) basis matrix of size n×n.
+def _get_dct_matrices(n: int = BLOCK_SIZE) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(D, D.T)``, the orthonormal 1D DCT-II basis and its transpose.
 
-    This implements the same transform class JPEG uses (up to overall scaling).
-    The matrix is cached so it is only computed once per block size.
+    This implements the same transform class JPEG uses (up to overall
+    scaling). Both matrices are cached as contiguous arrays so that every
+    forward/inverse call is a pair of batched GEMMs with no per-call
+    transposition or dtype promotion.
     """
 
-    if n in _DCT_CACHE:
-        return _DCT_CACHE[n]
+    cached = _DCT_CACHE.get(n)
+    if cached is not None:
+        return cached
 
-    # Create DCT-II matrix with "ortho" normalization
-    D = np.zeros((n, n), dtype=np.float64)
-    factor = np.pi / (2.0 * n)
-    scale0 = np.sqrt(1.0 / n)
-    scale = np.sqrt(2.0 / n)
+    # DCT-II with "ortho" normalization, built as an outer product.
+    u = np.arange(n).reshape(n, 1)
+    x = np.arange(n).reshape(1, n)
+    D = np.cos((2 * x + 1) * u * np.pi / (2.0 * n))
+    D *= np.sqrt(2.0 / n)
+    D[0, :] = np.sqrt(1.0 / n)
 
-    for u in range(n):
-        alpha = scale0 if u == 0 else scale
-        for x in range(n):
-            D[u, x] = alpha * np.cos((2 * x + 1) * u * factor)
+    D = np.ascontiguousarray(D, dtype=DCT_DTYPE)
+    DT = np.ascontiguousarray(D.T)
 
-    _DCT_CACHE[n] = D
-    return D
+    _DCT_CACHE[n] = (D, DT)
+    return D, DT
+
+
+def _to_blocks(img: np.ndarray, block_size: int = BLOCK_SIZE) -> np.ndarray:
+    """View a padded (H, W) image as (blocks_y, blocks_x, block, block)."""
+
+    h, w = img.shape
+    return img.reshape(
+        h // block_size, block_size, w // block_size, block_size
+    ).transpose(0, 2, 1, 3)
+
+
+def _from_blocks(blocks: np.ndarray, block_size: int = BLOCK_SIZE) -> np.ndarray:
+    """Inverse of :func:`_to_blocks`: reassemble blocks into a 2D image."""
+
+    by, bx = blocks.shape[:2]
+    return blocks.transpose(0, 2, 1, 3).reshape(by * block_size, bx * block_size)
+
+
+def _forward_dct_2d(blocks: np.ndarray) -> np.ndarray:
+    """Apply the separable 2D DCT to an array of shape ``(..., 8, 8)``.
+
+    ``matmul`` broadcasts over all leading dimensions, so an entire image is
+    transformed in a single batched call.
+    """
+
+    D, DT = _get_dct_matrices(blocks.shape[-1])
+    return D @ blocks @ DT
+
+
+def _inverse_dct_2d(blocks: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`_forward_dct_2d`."""
+
+    D, DT = _get_dct_matrices(blocks.shape[-1])
+    return DT @ blocks @ D
 
 
 def _pad_to_block_size(
@@ -200,16 +254,37 @@ def _pad_to_block_size(
     return padded, padded.shape
 
 
+def _clamp_quality(quality: int) -> int:
+    """Validate and clamp a quality factor into [1, 100].
+
+    This is the single point at which quality is normalised. Every public
+    entry point must funnel through it *before* the value is stored, so that
+    the quality recorded in a :class:`CompressedImage` (and written to the
+    container header) is always the same value the encoder actually used.
+
+    Clamping only inside :func:`_quality_to_scale` is not sufficient: the
+    unclamped value would still be persisted, and a value outside [0, 255]
+    would alias when packed into the single-byte header field. A quality of
+    -5, for example, encodes with the q=1 matrix but stores byte 251, which
+    the decoder then clamps to 100 -- reconstructing against a completely
+    different matrix and silently producing garbage.
+    """
+
+    if isinstance(quality, bool) or not isinstance(quality, (int, np.integer)):
+        raise TypeError(f"quality must be an integer, got {type(quality).__name__}")
+
+    return max(1, min(100, int(quality)))
+
+
 def _quality_to_scale(quality: int) -> float:
     """Map JPEG-like quality [1, 100] to a scaling factor for Q.
 
     This follows the common approximation used in many JPEG encoders.
+    Callers are expected to have passed ``quality`` through
+    :func:`_clamp_quality` already; the clamp here is defensive only.
     """
 
-    if quality < 1:
-        quality = 1
-    elif quality > 100:
-        quality = 100
+    quality = _clamp_quality(quality)
 
     if quality < 50:
         scale = 5000.0 / quality
@@ -248,31 +323,19 @@ def compress_array(image: np.ndarray, quality: int = 50) -> CompressedImage:
     if image.ndim != 2:
         raise ValueError("compress_array expects a 2D grayscale image")
 
+    quality = _clamp_quality(quality)
+
     orig_shape = image.shape
-    img = image.astype(np.float32, copy=False)
+    img = image.astype(DCT_DTYPE, copy=False)
 
     # Pad to full blocks and level shift
     padded, padded_shape = _pad_to_block_size(img, BLOCK_SIZE)
-    padded = padded - 128.0
+    padded = padded - DCT_DTYPE(128.0)
 
-    h_p, w_p = padded_shape
-    by = h_p // BLOCK_SIZE
-    bx = w_p // BLOCK_SIZE
+    Q = _build_quant_matrix(quality).astype(DCT_DTYPE)
 
-    D = _get_dct_matrix(BLOCK_SIZE)
-    Q = _build_quant_matrix(quality)
-
-    coeffs = np.empty((by, bx, BLOCK_SIZE, BLOCK_SIZE), dtype=np.int16)
-
-    for j in range(by):
-        for i in range(bx):
-            block = padded[
-                j * BLOCK_SIZE : (j + 1) * BLOCK_SIZE,
-                i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE,
-            ]
-            dct_block = D @ block @ D.T
-            q_block = np.round(dct_block / Q).astype(np.int16)
-            coeffs[j, i] = q_block
+    blocks = _to_blocks(padded, BLOCK_SIZE)
+    coeffs = np.round(_forward_dct_2d(blocks) / Q).astype(np.int16)
 
     return CompressedImage(
         coeffs=coeffs,
@@ -292,21 +355,10 @@ def decompress_to_array(comp: CompressedImage) -> np.ndarray:
     if h_p != by * BLOCK_SIZE or w_p != bx * BLOCK_SIZE:
         raise ValueError("Inconsistent block/padded shapes in compressed data")
 
-    D = _get_dct_matrix(BLOCK_SIZE)
-    Q = _build_quant_matrix(comp.quality)
+    Q = _build_quant_matrix(comp.quality).astype(DCT_DTYPE)
 
-    padded = np.empty((h_p, w_p), dtype=np.float32)
-
-    for j in range(by):
-        for i in range(bx):
-            q_block = comp.coeffs[j, i].astype(np.float32)
-            dct_block = q_block * Q
-            block = D.T @ dct_block @ D
-            block = block + 128.0
-            padded[
-                j * BLOCK_SIZE : (j + 1) * BLOCK_SIZE,
-                i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE,
-            ] = block
+    blocks = _inverse_dct_2d(comp.coeffs.astype(DCT_DTYPE) * Q)
+    padded = _from_blocks(blocks, BLOCK_SIZE) + DCT_DTYPE(128.0)
 
     # Crop back to original shape and clip to valid range
     img = padded[:h, :w]
@@ -314,55 +366,15 @@ def decompress_to_array(comp: CompressedImage) -> np.ndarray:
     return img
 
 
-def compress_image_file(input_path: str, output_path: str, quality: int = 50) -> None:
-    """Compress a grayscale image from disk and save a custom .npz file.
-
-    This uses only DCT + quantization without entropy coding. It is kept for
-    reference alongside the Huffman-based compressor implemented below.
-    """
-
-    with Image.open(input_path) as im:
-        im = im.convert("L")  # ensure grayscale
-        arr = np.array(im, dtype=np.uint8)
-
-    comp = compress_array(arr, quality=quality)
-
-    np.savez_compressed(
-        output_path,
-        coeffs=comp.coeffs,
-        orig_shape=np.array(comp.orig_shape, dtype=np.int32),
-        padded_shape=np.array(comp.padded_shape, dtype=np.int32),
-        quality=np.int32(comp.quality),
-    )
-
-
-def decompress_image_file(input_path: str, output_path: str) -> None:
-    """Decompress from a custom .npz file and save a grayscale PNG image."""
-
-    data = np.load(input_path)
-
-    coeffs = data["coeffs"].astype(np.int16)
-    orig_shape = tuple(int(x) for x in data["orig_shape"])
-    padded_shape = tuple(int(x) for x in data["padded_shape"])
-    quality = int(data["quality"])
-
-    comp = CompressedImage(
-        coeffs=coeffs,
-        orig_shape=orig_shape,  # type: ignore[arg-type]
-        padded_shape=padded_shape,  # type: ignore[arg-type]
-        quality=quality,
-    )
-
-    img_arr = decompress_to_array(comp)
-    im = Image.fromarray(img_arr, mode="L")
-    im.save(output_path)
-
-
 # === Huffman-based entropy coding (custom container) ========================
 
 
 class _BitWriter:
-    """Simple big-endian bit writer with 0xFF byte stuffing support."""
+    """Simple big-endian bit writer.
+
+    Bits are packed most-significant-first and the final partial byte is
+    zero-padded by :meth:`flush`.
+    """
 
     def __init__(self) -> None:
         self._buffer = bytearray()
@@ -479,8 +491,6 @@ def _build_huffman_table(freqs: dict[int, int]) -> dict[int, tuple[int, int]]:
         return {sym: (0, 1)}
 
     # Build Huffman tree using a simple priority queue.
-    import heapq
-
     counter = 0
     heap: list[tuple[int, int, object]] = []
     for sym, f in items:
@@ -518,6 +528,17 @@ def _build_huffman_table(freqs: dict[int, int]) -> dict[int, tuple[int, int]]:
         table[sym] = (code, length)
         code += 1
         prev_len = length
+
+    # The container serialises codes in 4 bytes and the decoder only scans
+    # lengths 1..MAX_CODE_LENGTH, so anything longer would be silently
+    # truncated into an undecodable stream. Natural images stay far below
+    # this bound, but fail loudly rather than emit a corrupt file.
+    max_len = max(lengths.values())
+    if max_len > MAX_CODE_LENGTH:
+        raise ValueError(
+            f"Huffman code length {max_len} exceeds the {MAX_CODE_LENGTH}-bit "
+            "limit supported by the container format"
+        )
 
     return table
 
@@ -740,44 +761,77 @@ def _decode_blocks_huffman(
     return coeffs
 
 
-def _serialize_huffman_table(table: dict[int, tuple[int, int]], symbol_count: int) -> bytes:
+def _read_exactly(f, n: int) -> bytes:
+    """Read exactly ``n`` bytes or raise, so truncated files fail loudly."""
+
+    data = f.read(n)
+    if len(data) != n:
+        raise ValueError(
+            f"Truncated container: expected {n} bytes, got {len(data)}"
+        )
+    return data
+
+
+def _serialize_huffman_table(table: dict[int, tuple[int, int]]) -> bytes:
     buf = bytearray()
-    used = {sym: (code, length) for sym, (code, length) in table.items()}
-    buf.extend(len(used).to_bytes(2, "big"))  # count of used symbols
-    for sym, (code, length) in sorted(used.items()):
+    buf.extend(len(table).to_bytes(2, "big"))  # count of used symbols
+    for sym, (code, length) in sorted(table.items()):
         buf.append(sym & 0xFF)
         buf.append(length & 0xFF)
         buf.extend(int(code).to_bytes(4, "big"))
     return bytes(buf)
 
 
-def _deserialize_huffman_table(data: bytes, symbol_count: int) -> dict[int, tuple[int, int]]:
+def _deserialize_huffman_table(data: bytes) -> dict[int, tuple[int, int]]:
+    if len(data) < 2:
+        raise ValueError("Truncated Huffman table header")
+
     table: dict[int, tuple[int, int]] = {}
     count = int.from_bytes(data[0:2], "big")
+
+    expected = 2 + count * 6
+    if len(data) < expected:
+        raise ValueError(
+            f"Truncated Huffman table: need {expected} bytes for {count} "
+            f"symbols, got {len(data)}"
+        )
+
     offset = 2
     for _ in range(count):
         sym = data[offset]
         length = data[offset + 1]
         code = int.from_bytes(data[offset + 2: offset + 6], "big")
         offset += 6
+        if not 1 <= length <= MAX_CODE_LENGTH:
+            raise ValueError(f"Invalid Huffman code length {length} for symbol {sym}")
         table[sym] = (code, length)
+
+    if not table:
+        raise ValueError("Huffman table contains no symbols")
+
     return table
 
 
 def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) -> None:
     """Compress an image using DCT + quantization + Huffman into a custom binary.
 
-    The container format is:
-        magic:      4 bytes   ASCII 'ICJ1'
+    The ICJ2 container format is::
+
+        magic:      4 bytes   ASCII 'ICJ2'
         height:     4 bytes   unsigned big-endian
         width:      4 bytes   unsigned big-endian
-        quality:    1 byte    1-100
+        quality:    1 byte    1-100 (always clamped before writing)
         blocks_y:   2 bytes   unsigned big-endian
         blocks_x:   2 bytes   unsigned big-endian
-        dc_table:   12 * 5 bytes  (len, 32-bit code)
-        ac_table:   256 * 5 bytes (len, 32-bit code)
+        dc_len:     2 bytes   byte length of the DC table that follows
+        dc_table:   dc_len bytes
+        ac_len:     2 bytes   byte length of the AC table that follows
+        ac_table:   ac_len bytes
         bit_len:    4 bytes   length of following bitstream in bytes
-        bitstream:  bit_len bytes (with 0xFF stuffing as written by _BitWriter)
+        bitstream:  bit_len bytes, big-endian bit packing, zero-padded
+
+    Each Huffman table is serialised as a 2-byte count of used symbols
+    followed by that many 6-byte entries of ``(symbol, length, 4-byte code)``.
     """
 
     with Image.open(input_path) as im:
@@ -794,7 +848,7 @@ def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) 
     bx = w_p // BLOCK_SIZE
 
     header = bytearray()
-    header.extend(b"ICJ1")
+    header.extend(MAGIC)
     header.extend(int(h).to_bytes(4, "big"))
     header.extend(int(w).to_bytes(4, "big"))
     header.append(int(comp.quality) & 0xFF)
@@ -802,8 +856,8 @@ def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) 
     header.extend(int(bx).to_bytes(2, "big"))
 
     # Write tables with their byte lengths prefixed
-    dc_bytes = _serialize_huffman_table(dc_table, 12)
-    ac_bytes = _serialize_huffman_table(ac_table, 256)
+    dc_bytes = _serialize_huffman_table(dc_table)
+    ac_bytes = _serialize_huffman_table(ac_table)
     header.extend(len(dc_bytes).to_bytes(2, "big"))
     header.extend(dc_bytes)
     header.extend(len(ac_bytes).to_bytes(2, "big"))
@@ -825,25 +879,25 @@ def decompress_huffman_file(input_path: str, output_path: str) -> None:
 
     with open(input_path, "rb") as f:
         magic = f.read(4)
-        if magic != b"ICJ1":
-            raise ValueError("Not an ICJ1 Huffman-compressed file")
-        h = int.from_bytes(f.read(4), "big")
-        w = int.from_bytes(f.read(4), "big")
-        quality = f.read(1)[0]
-        by = int.from_bytes(f.read(2), "big")
-        bx = int.from_bytes(f.read(2), "big")
+        if magic != MAGIC:
+            raise ValueError(
+                f"Not an {MAGIC.decode()} file (bad magic: {magic!r})"
+            )
+        h = int.from_bytes(_read_exactly(f, 4), "big")
+        w = int.from_bytes(_read_exactly(f, 4), "big")
+        quality = _read_exactly(f, 1)[0]
+        by = int.from_bytes(_read_exactly(f, 2), "big")
+        bx = int.from_bytes(_read_exactly(f, 2), "big")
 
-        dc_len = int.from_bytes(f.read(2), "big")
-        dc_bytes = f.read(dc_len)
-        ac_len = int.from_bytes(f.read(2), "big")
-        ac_bytes = f.read(ac_len)
-        dc_table = _deserialize_huffman_table(dc_bytes, 12)
-        ac_table = _deserialize_huffman_table(ac_bytes, 256)
-        dc_table = _deserialize_huffman_table(dc_bytes, 12)
-        ac_table = _deserialize_huffman_table(ac_bytes, 256)
+        dc_len = int.from_bytes(_read_exactly(f, 2), "big")
+        dc_bytes = _read_exactly(f, dc_len)
+        ac_len = int.from_bytes(_read_exactly(f, 2), "big")
+        ac_bytes = _read_exactly(f, ac_len)
+        dc_table = _deserialize_huffman_table(dc_bytes)
+        ac_table = _deserialize_huffman_table(ac_bytes)
 
-        bit_len = int.from_bytes(f.read(4), "big")
-        bitstream = f.read(bit_len)
+        bit_len = int.from_bytes(_read_exactly(f, 4), "big")
+        bitstream = _read_exactly(f, bit_len)
 
     coeffs = _decode_blocks_huffman(by, bx, bitstream, dc_table, ac_table)
 
@@ -859,6 +913,25 @@ def decompress_huffman_file(input_path: str, output_path: str) -> None:
     im.save(output_path)
 
 
+def _quality_arg(value: str) -> int:
+    """argparse type for --quality.
+
+    The library API clamps silently, but at the CLI an out-of-range value is
+    far more likely to be a typo than an intent, so reject it outright rather
+    than quietly encoding at a different quality than was asked for.
+    """
+
+    try:
+        q = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"quality must be an integer, got {value!r}")
+
+    if not 1 <= q <= 100:
+        raise argparse.ArgumentTypeError(f"quality must be in [1, 100], got {q}")
+
+    return q
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="JPEG-like DCT-based compressor for grayscale images.",
@@ -866,44 +939,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # compress (DCT + quantization only, stored as .npz)
-    p_compress = subparsers.add_parser("compress", help="Compress an image to .npz")
+    p_compress = subparsers.add_parser(
+        "compress",
+        help="Compress an image with DCT + quantization + Huffman into ICJ2",
+    )
     p_compress.add_argument("input", help="Input image path (any format Pillow supports)")
-    p_compress.add_argument("output", help="Output .npz file path")
+    p_compress.add_argument("output", help="Output binary path (e.g., .icj)")
     p_compress.add_argument(
         "--quality",
-        type=int,
+        type=_quality_arg,
         default=50,
         help="JPEG-like quality factor [1-100] (default: 50)",
     )
 
-    # decompress .npz back to PNG
     p_decompress = subparsers.add_parser(
-        "decompress", help="Decompress from .npz to a grayscale PNG"
+        "decompress",
+        help="Decompress an ICJ2 file back to a grayscale PNG",
     )
-    p_decompress.add_argument("input", help="Input .npz file path")
+    p_decompress.add_argument("input", help="Input .icj file path")
     p_decompress.add_argument("output", help="Output image path (e.g., .png)")
-
-    # Huffman-based codec (custom ICJ1 container)
-    p_huff_comp = subparsers.add_parser(
-        "compress_huff",
-        help="Compress image with DCT + quantization + Huffman into custom binary",
-    )
-    p_huff_comp.add_argument("input", help="Input image path (any format Pillow supports)")
-    p_huff_comp.add_argument("output", help="Output binary path (e.g., .icj)")
-    p_huff_comp.add_argument(
-        "--quality",
-        type=int,
-        default=50,
-        help="JPEG-like quality factor [1-100] (default: 50)",
-    )
-
-    p_huff_decomp = subparsers.add_parser(
-        "decompress_huff",
-        help="Decompress custom Huffman-compressed binary back to PNG",
-    )
-    p_huff_decomp.add_argument("input", help="Input .icj file path")
-    p_huff_decomp.add_argument("output", help="Output image path (e.g., .png)")
 
     return parser
 
@@ -913,12 +967,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "compress":
-        compress_image_file(args.input, args.output, quality=args.quality)
-    elif args.command == "decompress":
-        decompress_image_file(args.input, args.output)
-    elif args.command == "compress_huff":
         compress_huffman_file(args.input, args.output, quality=args.quality)
-    elif args.command == "decompress_huff":
+    elif args.command == "decompress":
         decompress_huffman_file(args.input, args.output)
     else:
         parser.error(f"Unknown command: {args.command}")

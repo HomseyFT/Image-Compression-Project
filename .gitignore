@@ -1,1 +1,6 @@
-/__pycache__/
+__pycache__/
+*.icj
+output*.png
+.pytest_cache/
+*.egg-info/
+SPEC.md
