@@ -375,10 +375,6 @@ class _BitWriter:
 
     def _write_byte(self, b: int) -> None:
         self._buffer.append(b & 0xFF)
-        if b == 0xFF:
-            # Stuff a zero byte to avoid marker confusion in case the user
-            # ever wraps this into a JPEG-like container.
-            self._buffer.append(0x00)
 
     def write_bits(self, value: int, n_bits: int) -> None:
         if n_bits == 0:
@@ -414,10 +410,6 @@ class _BitReader:
             raise EOFError("Unexpected end of bitstream")
         b = self._data[self._pos]
         self._pos += 1
-        if b == 0xFF:
-            # Skip stuffed zero byte if present.
-            if self._pos < len(self._data) and self._data[self._pos] == 0x00:
-                self._pos += 1
         return b
 
     def read_bit(self) -> int:
@@ -749,40 +741,26 @@ def _decode_blocks_huffman(
 
 
 def _serialize_huffman_table(table: dict[int, tuple[int, int]], symbol_count: int) -> bytes:
-    """Serialize Huffman table as fixed-size (len, code) pairs per symbol.
-
-    We store:
-        - 1 byte: code length in bits (0 if symbol unused)
-        - 4 bytes: canonical code value (big-endian)
-
-    Using 4 bytes for the code avoids overflow even if some codes exceed 16 bits.
-    """
-
     buf = bytearray()
-    for sym in range(symbol_count):
-        code_len = 0
-        code = 0
-        if sym in table:
-            code, code_len = table[sym]
-        buf.append(code_len & 0xFF)
+    used = {sym: (code, length) for sym, (code, length) in table.items()}
+    buf.extend(len(used).to_bytes(2, "big"))  # count of used symbols
+    for sym, (code, length) in sorted(used.items()):
+        buf.append(sym & 0xFF)
+        buf.append(length & 0xFF)
         buf.extend(int(code).to_bytes(4, "big"))
     return bytes(buf)
 
 
 def _deserialize_huffman_table(data: bytes, symbol_count: int) -> dict[int, tuple[int, int]]:
-    """Inverse of :func:`_serialize_huffman_table`. Returns symbol -> (code, len)."""
-
     table: dict[int, tuple[int, int]] = {}
-    expected_len = symbol_count * 5
-    if len(data) != expected_len:
-        raise ValueError("Corrupt Huffman table payload")
-    offset = 0
-    for sym in range(symbol_count):
-        code_len = data[offset]
-        code = int.from_bytes(data[offset + 1 : offset + 5], "big")
-        offset += 5
-        if code_len:
-            table[sym] = (code, code_len)
+    count = int.from_bytes(data[0:2], "big")
+    offset = 2
+    for _ in range(count):
+        sym = data[offset]
+        length = data[offset + 1]
+        code = int.from_bytes(data[offset + 2: offset + 6], "big")
+        offset += 6
+        table[sym] = (code, length)
     return table
 
 
@@ -823,8 +801,13 @@ def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) 
     header.extend(int(by).to_bytes(2, "big"))
     header.extend(int(bx).to_bytes(2, "big"))
 
-    header.extend(_serialize_huffman_table(dc_table, 12))
-    header.extend(_serialize_huffman_table(ac_table, 256))
+    # Write tables with their byte lengths prefixed
+    dc_bytes = _serialize_huffman_table(dc_table, 12)
+    ac_bytes = _serialize_huffman_table(ac_table, 256)
+    header.extend(len(dc_bytes).to_bytes(2, "big"))
+    header.extend(dc_bytes)
+    header.extend(len(ac_bytes).to_bytes(2, "big"))
+    header.extend(ac_bytes)
 
     header.extend(len(bitstream).to_bytes(4, "big"))
 
@@ -850,9 +833,12 @@ def decompress_huffman_file(input_path: str, output_path: str) -> None:
         by = int.from_bytes(f.read(2), "big")
         bx = int.from_bytes(f.read(2), "big")
 
-        # Each Huffman entry is 1 (length) + 4 (code) = 5 bytes per symbol
-        dc_bytes = f.read(12 * 5)
-        ac_bytes = f.read(256 * 5)
+        dc_len = int.from_bytes(f.read(2), "big")
+        dc_bytes = f.read(dc_len)
+        ac_len = int.from_bytes(f.read(2), "big")
+        ac_bytes = f.read(ac_len)
+        dc_table = _deserialize_huffman_table(dc_bytes, 12)
+        ac_table = _deserialize_huffman_table(ac_bytes, 256)
         dc_table = _deserialize_huffman_table(dc_bytes, 12)
         ac_table = _deserialize_huffman_table(ac_bytes, 256)
 
