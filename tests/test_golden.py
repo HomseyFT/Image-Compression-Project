@@ -25,20 +25,23 @@ import compression as c
 
 # quality -> (bitstream bytes, MSE, count of non-zero quantized coefficients)
 #
-# Re-pinned in phase 3 (float64 loop -> float32 batched DCT). The change was
-# verified as pure precision, not a restructuring error: running the new
-# vectorized path in float64 reproduces the old per-block loop bit-exactly at
-# every quality, and the float32 deltas are max |1| on 0.003%-0.078% of
-# coefficients. Full-image PSNR moved 35.41 dB -> 35.41 dB.
+# Re-pinned in phase 4.2 (trellis quantization on by default). Rate drops
+# sharply and MSE rises at the same quality number -- that is the intended
+# trade, and on its own it proves nothing, since lowering --quality does the
+# same. The justification is the equal-PSNR comparison in test_trellis.py:
+# ~9-10% fewer bytes at matched quality on photographic content.
 #
-# Previous (float64) pins, for reference:
-#   10: (3411, 274.6319, 5393)
-#   50: (10118, 68.2794, 14697)
-#   90: (22657, 7.1094, 29711)
+# Pin history:
+#   phase 2 (float64 DCT):  10: (3411, 274.6319, 5393)
+#                           50: (10118, 68.2794, 14697)
+#                           90: (22657, 7.1094, 29711)
+#   phase 3 (float32 DCT):  10: (3411, 274.7267, 5393)
+#                           50: (10117, 68.2933, 14693)
+#                           90: (22657, 7.1163, 29704)
 GOLDEN = {
-    10: (3411, 274.7267, 5393),
-    50: (10117, 68.2933, 14693),
-    90: (22657, 7.1163, 29704),
+    10: (2152, 381.9600, 3364),
+    50: (7927, 88.0864, 11101),
+    90: (21716, 7.4462, 28499),
 }
 
 RATE_TOLERANCE = 0.0  # exact; float32 is deterministic for a given numpy build

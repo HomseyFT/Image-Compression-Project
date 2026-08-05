@@ -150,13 +150,34 @@ def test_truncated_file_raises(tmp_path, sample_icj, keep):
         c.decompress_huffman_file(str(trunc), str(tmp_path / "o.png"))
 
 
-def test_corrupt_table_length_raises(tmp_path, sample_icj):
+def test_corrupt_code_length_raises(tmp_path, sample_icj):
+    """An out-of-range code length in the table must be rejected.
+
+    Header layout: magic 0-3, height 4-7, width 8-11, quality 12,
+    blocks_y 13-14, blocks_x 15-16, dc_len 17-18, then the DC table --
+    2-byte symbol count at 19-20, then (symbol, length) pairs. Byte 22 is
+    therefore the first code length.
+    """
+
     data = bytearray(sample_icj.read_bytes())
-    data[17] = 0xFF  # implausible code length inside the DC table
+    assert 1 <= data[22] <= c.MAX_CODE_LENGTH, "offset 22 is not a code length"
+    data[22] = 0xFF
     bad = tmp_path / "c.icj"
     bad.write_bytes(data)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="code length"):
+        c.decompress_huffman_file(str(bad), str(tmp_path / "o.png"))
+
+
+def test_corrupt_table_length_field_raises(tmp_path, sample_icj):
+    """A bogus table byte-length must be caught as truncation."""
+
+    data = bytearray(sample_icj.read_bytes())
+    data[17] = 0xFF  # dc_len high byte -> table claims to be huge
+    bad = tmp_path / "c2.icj"
+    bad.write_bytes(data)
+
+    with pytest.raises(ValueError, match="[Tt]runcated"):
         c.decompress_huffman_file(str(bad), str(tmp_path / "o.png"))
 
 

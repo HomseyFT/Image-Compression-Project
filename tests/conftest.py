@@ -19,9 +19,14 @@ Each entry isolates a different failure mode of the codec:
     Per-pixel alternation. Drives the maximum-magnitude AC coefficient and
     is the worst case for the category/nibble packing.
 
-Synthetic images alone are a poor rate-distortion gate -- their statistics
-are not those of natural images -- so ``photo`` (dog.png) is included and
-should be preferred for any R-D comparison. See ``real_images``.
+These fixtures test *correctness*. Do not use them to score rate-distortion
+changes: ``flat``, ``gradient`` and ``edges`` produce degenerate R-D curves
+(near-empty files, and flat spots where raising quality gains +0.00 dB while
+the rate grows), which makes "rate at a given PSNR" numerically unstable and
+manufactures phantom gains and losses of 5% or more. An early trellis lambda
+fit was skewed by exactly this. Score R-D only on content whose curve rises
+monotonically -- in practice, photographs. See ``real_images`` and
+``test_trellis.test_rd_scoring_requires_a_monotone_curve``.
 """
 
 from __future__ import annotations
@@ -31,6 +36,8 @@ import pathlib
 import numpy as np
 import pytest
 from PIL import Image
+
+import compression
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 IMAGE_DIR = pathlib.Path(__file__).resolve().parent / "images"
@@ -84,9 +91,8 @@ def photo() -> np.ndarray:
     path = REPO_ROOT / "dog.png"
     if not path.exists():
         pytest.skip("dog.png not available")
-    with Image.open(path) as im:
-        im = im.convert("L").resize((256, 256), Image.LANCZOS)
-        return np.array(im, dtype=np.uint8)
+    full = Image.fromarray(compression._load_grayscale(str(path)), mode="L")
+    return np.array(full.resize((256, 256), Image.LANCZOS), dtype=np.uint8)
 
 
 @pytest.fixture(scope="session")
