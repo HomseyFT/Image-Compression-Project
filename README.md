@@ -1,13 +1,13 @@
 # Image-Compression-Project
 
-A minimal, self-contained JPEG-style compressor for **grayscale and colour**
+A minimal, self-contained JPEG-style compressor for **grayscale and color**
 images, built on NumPy and Pillow. It uses an 8×8 block DCT, JPEG-like
 quantization matrices, YCbCr with chroma subsampling,
 **rate-distortion optimized (trellis) quantization**, and JPEG-style entropy
 coding with per-image Huffman tables **split across frequency-band contexts**.
 
 Across an 11-image corpus it needs **17.8% fewer bytes than libjpeg-turbo at
-equal quality** in colour, and **14.6% fewer** in grayscale (mean BD-rate,
+equal quality** in color, and **14.6% fewer** in grayscale (mean BD-rate,
 `optimize=True`, native resolution, matched chroma subsampling).
 
 ## Install
@@ -54,7 +54,7 @@ Since character cells are about twice as tall as they are wide, one pixel per
 column and two per row keeps the aspect ratio right with no correction factor.
 
 Colour depth is **detected, not assumed** — 24-bit if the terminal advertises
-it, else the 256-colour cube, else ASCII. Piping to a file or a non-TTY falls
+it, else the 256-color cube, else ASCII. Piping to a file or a non-TTY falls
 back to ASCII automatically, and `NO_COLOR` is honoured, so redirected output
 never gets escape soup injected into it.
 
@@ -112,7 +112,7 @@ Planar costs nothing here and buys two things: raster DC prediction, worth
 ~3% on DC (an MCU walk breaks left-neighbour adjacency on a quarter of
 transitions), and **no MCU padding**. Interleaved JPEG must pad luma to 16×16
 at 4:2:0 so subsampled chroma lands on block boundaries; planar planes pad to
-8 independently, so that coupling — the classic place to get colour wrong —
+8 independently, so that coupling — the classic place to get color wrong —
 simply does not exist. What planar gives up is streaming decode, since the
 whole Y plane must be buffered before any pixel can be emitted. With no
 streaming requirement that costs ~6 MB and nothing else.
@@ -195,7 +195,7 @@ width      4 bytes   big-endian unsigned
 quality    1 byte    1..100 (always clamped before writing)
 format     1 byte    high nibble = components (1 or 3)
                      low  nibble = chroma sampling (0=4:4:4, 1=4:2:2, 2=4:2:0)
-per class  1 set for grayscale, 2 (luma, chroma) for colour:
+per class  1 set for grayscale, 2 (luma, chroma) for color:
   dc_table   self-delimiting
   layout     1 byte    which AC band layout was chosen
   present    2 bytes   bitmap; bit i set if context i has a table
@@ -215,11 +215,11 @@ matters at the small end: a 3×5 file is 33 bytes.
 
 **Block dimensions are not stored** — they follow from the image size and
 sampling scheme. ICJ3 wrote them redundantly; dropping them is what lets a
-colour-capable container be *smaller* on grayscale than its grayscale-only
-predecessor (218,333 vs 218,336 bytes on the sample), so colour costs the
+color-capable container be *smaller* on grayscale than its grayscale-only
+predecessor (218,333 vs 218,336 bytes on the sample), so color costs the
 grayscale path nothing.
 
-ICJ4 added colour. ICJ3 replaced ICJ2's single AC table. ICJ2 replaced ICJ1,
+ICJ4 added color. ICJ3 replaced ICJ2's single AC table. ICJ2 replaced ICJ1,
 which could persist an unclamped quality byte and decode against the wrong
 quantization matrix. Older files are rejected, and an unknown `layout` id,
 component count or sampling code is rejected rather than silently mis-decoded.
@@ -233,10 +233,10 @@ python -m pytest
 836 tests, ~8s. Covers the lossless coefficient round trip, padding and shape
 restoration, quality clamping, container fuzzing (bad magic, truncation,
 corrupt tables, unknown band layout), bit I/O, Huffman construction, trellis
-invariants, AC context causality, colour transform and resampling, all three
+invariants, AC context causality, color transform and resampling, all three
 subsampling schemes, pinned golden rate/distortion values, and the BD-rate
 harness (including that it refuses unscorable curves), quality-dial
-calibration, and the terminal viewer's geometry and colour-mode detection.
+calibration, and the terminal viewer's geometry and color-mode detection.
 
 Two tests carry more weight than the rest. `test_contexts_match_a_sequential_decoder`
 checks the encoder's bulk, vectorized context assignment against a naive loop
@@ -296,7 +296,7 @@ by a factor of ~7, and the naive value was worse than no trellis at all.
 
 ```bash
 python -m bench                      # BD-rate report, grayscale, 512px, fast
-python -m bench --color              # colour at 4:2:0
+python -m bench --color              # color at 4:2:0
 python -m bench --max-side 0         # native resolution
 python -m bench.fetch_corpus         # top up images/ to the full Kodak set
 ```
@@ -309,7 +309,7 @@ BD-rate is the standard "average % bitrate change at equal quality" metric —
 negative means fewer bits for the same PSNR. Corpus of 11 photographs
 (`dog.png` plus Kodak 01–10) at native resolution, quality 20–90:
 
-| image | grayscale | colour 4:2:0 |
+| image | grayscale | color 4:2:0 |
 |---|---|---|
 | dog (2500×2500) | −22.96% | −23.23% |
 | kodim01 | −12.91% | −14.78% |
