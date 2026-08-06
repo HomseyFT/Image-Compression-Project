@@ -22,3 +22,6 @@ filterwarnings = [
 
 [tool.setuptools]
 py-modules = ["compression"]
+
+[tool.setuptools.packages.find]
+include = ["bench*"]
