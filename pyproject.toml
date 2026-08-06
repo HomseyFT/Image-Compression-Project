@@ -13,6 +13,7 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 icj = "compression:main"
+icjview = "icjview:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -21,7 +22,7 @@ filterwarnings = [
 ]
 
 [tool.setuptools]
-py-modules = ["compression"]
+py-modules = ["compression", "icjview"]
 
 [tool.setuptools.packages.find]
 include = ["bench*"]

@@ -7,7 +7,7 @@ quantization matrices, YCbCr with chroma subsampling,
 coding with per-image Huffman tables **split across frequency-band contexts**.
 
 Across an 11-image corpus it needs **17.8% fewer bytes than libjpeg-turbo at
-equal quality** in colour, and **14.7% fewer** in grayscale (mean BD-rate,
+equal quality** in colour, and **14.6% fewer** in grayscale (mean BD-rate,
 `optimize=True`, native resolution, matched chroma subsampling).
 
 ## Install
@@ -28,8 +28,45 @@ Colour is automatic: an RGB input is coded as YCbCr, a greyscale one as a
 single plane.
 
 Quality is an integer in `[1, 100]`, higher = better quality and larger output
-(default 50). Out-of-range values are rejected at the CLI; the library API
-clamps instead.
+(default 50), **calibrated so that quality N looks like JPEG quality N**. Add
+`--sampling 0` for 4:4:4 chroma (default is 4:2:0, as libjpeg). Out-of-range
+values are rejected at the CLI; the library API clamps instead.
+
+Note that the `.icj` is the compressed artifact. Decompressing to PNG produces
+a *different format* — an RGB PNG of a photo is routinely larger than the
+palette PNG you started from, which says nothing about the codec. Compare
+against the `.icj`.
+
+## Terminal viewer
+
+```bash
+icjview photo.icj                      # or: python icjview.py photo.icj
+icjview photo.icj --info               # dimensions, size, ratio, sampling
+icjview a.png b.icj --compare          # side by side, equal size
+icjview photo.icj --color mono         # force ASCII
+```
+
+Rendering uses the Unicode upper-half block `▀`: the glyph's foreground paints
+the top half of the cell and its background the bottom, so one character
+carries **two** vertically stacked pixels. That's how `viu` and `chafa` work,
+and it needs nothing but plain ANSI escapes — no sixel, no kitty protocol.
+Since character cells are about twice as tall as they are wide, one pixel per
+column and two per row keeps the aspect ratio right with no correction factor.
+
+Colour depth is **detected, not assumed** — 24-bit if the terminal advertises
+it, else the 256-colour cube, else ASCII. Piping to a file or a non-TTY falls
+back to ASCII automatically, and `NO_COLOR` is honoured, so redirected output
+never gets escape soup injected into it.
+
+```
+$ icjview kodim03.icj --info --color mono
+kodim03.icj  [ICJ4]
+  768 x 512  RGB
+  file: 26,265 bytes
+  vs raw 1,179,648 bytes  ->  44.9x
+  components: 3   chroma: 4:2:0
+  internal quality: 71 (calibrated; higher than the requested value by design)
+```
 
 ## Programmatic use
 
@@ -94,8 +131,23 @@ because the DCT is orthonormal, coefficient-domain squared error equals
 pixel-domain squared error, so distortion is scored without an inverse
 transform per candidate.
 
-λ is tied to the quantizer via `_trellis_lambda`, so `--quality` keeps its
-usual meaning — each quality level simply becomes cheaper in bits.
+λ is tied to the quantizer via `_trellis_lambda`.
+
+**The quality dial is calibrated, and this was a real bug.** Minimising
+`D + λR` at a fixed quantizer slides *down* the R-D curve, so each quality
+level became cheaper in bits **and visibly worse**: uncalibrated, this codec's
+q50 looked like libjpeg **q31**, running ~18 quality points hot in the
+mid-range and converging only above q90. Requested quality is now treated as a
+JPEG-equivalent target and mapped to the internal quality that achieves it
+(`QUALITY_CALIBRATION`); at the same number we now measure slightly *better*
+than libjpeg in a 3–20% smaller file.
+
+Worth naming why this survived three phases: every check was BD-rate, which
+integrates over the whole curve and is **invariant to exactly this shift**. It
+cannot detect a mis-labelled dial by construction, and nothing else was
+looking. The README, SPEC and the `_trellis_lambda` docstring all asserted the
+opposite — that tying λ to the quantizer "keeps `--quality` meaning what it
+always did". That claim was never tested, and it was false.
 
 **λ is fitted per component class, and this matters more than it looks.**
 Running chroma at the luma-derived λ costs **4.9 percentage points** of
@@ -178,12 +230,13 @@ component count or sampling code is rejected rather than silently mis-decoded.
 python -m pytest
 ```
 
-808 tests, ~7s. Covers the lossless coefficient round trip, padding and shape
+836 tests, ~8s. Covers the lossless coefficient round trip, padding and shape
 restoration, quality clamping, container fuzzing (bad magic, truncation,
 corrupt tables, unknown band layout), bit I/O, Huffman construction, trellis
 invariants, AC context causality, colour transform and resampling, all three
 subsampling schemes, pinned golden rate/distortion values, and the BD-rate
-harness (including that it refuses unscorable curves).
+harness (including that it refuses unscorable curves), quality-dial
+calibration, and the terminal viewer's geometry and colour-mode detection.
 
 Two tests carry more weight than the rest. `test_contexts_match_a_sequential_decoder`
 checks the encoder's bulk, vectorized context assignment against a naive loop
@@ -258,18 +311,21 @@ negative means fewer bits for the same PSNR. Corpus of 11 photographs
 
 | image | grayscale | colour 4:2:0 |
 |---|---|---|
-| dog (2500×2500) | −23.41% | −23.36% |
-| kodim01 | −13.21% | −15.00% |
-| kodim02 | −16.80% | −22.19% |
-| kodim03 | −15.29% | −20.03% |
-| kodim04 | −12.72% | −16.97% |
-| kodim05 | −12.03% | −13.28% |
-| kodim06 | −15.09% | −17.44% |
-| kodim07 | −11.56% | −15.49% |
-| kodim08 | −12.91% | −13.91% |
-| kodim09 | −15.58% | −20.16% |
-| kodim10 | −13.58% | −18.21% |
-| **mean** | **−14.74%** | **−17.82%** |
+| dog (2500×2500) | −22.96% | −23.23% |
+| kodim01 | −12.91% | −14.78% |
+| kodim02 | −16.73% | −21.97% |
+| kodim03 | −15.20% | −20.00% |
+| kodim04 | −12.76% | −16.93% |
+| kodim05 | −11.83% | −13.11% |
+| kodim06 | −14.81% | −17.30% |
+| kodim07 | −11.82% | −15.72% |
+| kodim08 | −12.75% | −13.74% |
+| kodim09 | −15.57% | −20.25% |
+| kodim10 | −13.57% | −18.22% |
+| **mean** | **−14.63%** | **−17.75%** |
+
+Measured after the quality recalibration below; the figures moved by <0.1 pp,
+confirming that relabelling the dial does not move the curve.
 
 Colour is scored against libjpeg **at the same subsampling**, which matters:
 comparing our 4:2:2 against libjpeg's default 4:2:0 makes us look better
