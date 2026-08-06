@@ -79,8 +79,10 @@ def test_trellis_output_is_losslessly_codable(photo, quality):
     """Trellis output must survive the entropy coder untouched."""
 
     coeffs = c.compress_array(photo, quality=quality, trellis=True).coeffs
-    bitstream, dc, ac = c._encode_blocks_huffman(coeffs)
-    decoded = c._decode_blocks_huffman(coeffs.shape[0], coeffs.shape[1], bitstream, dc, ac)
+    bitstream, dc, ac, layout = c._encode_blocks_huffman(coeffs)
+    decoded = c._decode_blocks_huffman(
+        coeffs.shape[0], coeffs.shape[1], bitstream, dc, ac, layout
+    )
     np.testing.assert_array_equal(decoded, coeffs)
 
 

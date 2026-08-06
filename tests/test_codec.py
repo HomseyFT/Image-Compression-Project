@@ -27,8 +27,10 @@ def test_huffman_roundtrip_is_lossless(corpus, name, quality):
     """Encode -> decode must reproduce quantized coefficients bit-exactly."""
 
     coeffs = c.compress_array(corpus[name], quality=quality).coeffs
-    bitstream, dc, ac = c._encode_blocks_huffman(coeffs)
-    decoded = c._decode_blocks_huffman(coeffs.shape[0], coeffs.shape[1], bitstream, dc, ac)
+    bitstream, dc, ac, layout = c._encode_blocks_huffman(coeffs)
+    decoded = c._decode_blocks_huffman(
+        coeffs.shape[0], coeffs.shape[1], bitstream, dc, ac, layout
+    )
 
     assert decoded.dtype == coeffs.dtype
     np.testing.assert_array_equal(decoded, coeffs)
@@ -41,8 +43,10 @@ def test_roundtrip_random_shapes(shape, quality):
     img = (rng.rand(*shape) * 255).astype(np.uint8)
 
     coeffs = c.compress_array(img, quality=quality).coeffs
-    bitstream, dc, ac = c._encode_blocks_huffman(coeffs)
-    decoded = c._decode_blocks_huffman(coeffs.shape[0], coeffs.shape[1], bitstream, dc, ac)
+    bitstream, dc, ac, layout = c._encode_blocks_huffman(coeffs)
+    decoded = c._decode_blocks_huffman(
+        coeffs.shape[0], coeffs.shape[1], bitstream, dc, ac, layout
+    )
 
     np.testing.assert_array_equal(decoded, coeffs)
 
