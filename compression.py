@@ -185,6 +185,52 @@ TRELLIS_ITERATIONS = 2
 BLOCK_SIZE = 8
 
 
+# --- Quality calibration -----------------------------------------------------
+#
+# Trellis does not merely make a quality level cheaper in bits; it also makes
+# it *look worse*, because minimising D + lambda*R slides down the
+# rate-distortion curve at a fixed quantizer. Uncorrected, this codec's q50
+# looked like libjpeg q31 -- the dial ran roughly 18 points hot in the
+# mid-range, converging only above q90.
+#
+# That went unnoticed for three phases because every measurement was BD-rate,
+# which integrates over the whole curve and is *invariant* to exactly this
+# shift. It cannot detect a mis-labelled dial by construction, and no other
+# check was looking. (An earlier version of `_trellis_lambda`'s docstring
+# claimed the opposite outright -- that tying lambda to the quantizer "keeps
+# --quality meaning what it always did". It does not.)
+#
+# So requested quality is treated as a **JPEG-equivalent** target and mapped
+# to the internal quality that actually achieves it. The BD-rate advantage is
+# untouched: this relabels the dial, it does not move the curve.
+#
+# Anchors are (requested, internal), fitted on the Kodak corpus by matching
+# PSNR against libjpeg at matched subsampling. Colour and grayscale differ by
+# only a few points and share one curve; per-image spread is 4-7 quality
+# points in the mid-range, so finer precision would be false.
+QUALITY_CALIBRATION = (
+    (1, 1), (7, 10), (9, 20), (15, 30), (22, 40), (30, 50),
+    (41, 60), (58, 70), (75, 80), (89, 90), (95, 95), (100, 100),
+)
+
+_CALIBRATION_REQUESTED = np.array([q for q, _ in QUALITY_CALIBRATION], dtype=np.float64)
+_CALIBRATION_INTERNAL = np.array([q for _, q in QUALITY_CALIBRATION], dtype=np.float64)
+
+
+def _calibrate_quality(quality: int, trellis: bool) -> int:
+    """Map a requested JPEG-equivalent quality to the internal quality.
+
+    Identity when trellis is off: plain quantization already matches libjpeg's
+    scale point for point, so correcting it would break the case that was
+    right to begin with.
+    """
+
+    if not trellis:
+        return quality
+    mapped = np.interp(quality, _CALIBRATION_REQUESTED, _CALIBRATION_INTERNAL)
+    return int(max(1, min(100, round(float(mapped)))))
+
+
 # --- Colour ------------------------------------------------------------------
 #
 # Chroma sampling schemes. The factors are (horizontal, vertical) decimation
@@ -664,10 +710,18 @@ def _trellis_lambda(Q: np.ndarray, scale: float = TRELLIS_LAMBDA_SCALE) -> float
 
     Rate-distortion theory puts the optimum at ``lambda = -dD/dR``; for a
     uniform quantizer of step ``D`` the high-rate approximation is
-    proportional to the step squared. Tying lambda to the quantizer this way
-    keeps ``--quality`` meaning what it always did -- each quality level
-    simply becomes cheaper in bits -- rather than introducing a second knob
-    that silently slides along the rate-distortion curve.
+    proportional to the step squared.
+
+    **Correction.** This docstring used to claim that tying lambda to the
+    quantizer "keeps ``--quality`` meaning what it always did -- each quality
+    level simply becomes cheaper in bits -- rather than introducing a second
+    knob that silently slides along the rate-distortion curve". That was
+    wrong, and it was wrong in the specific way it denied: minimising
+    ``D + lambda*R`` at a fixed quantizer *does* slide down the curve, so each
+    quality level became cheaper in bits **and visibly worse**. Uncorrected,
+    q50 looked like libjpeg q31. See :data:`QUALITY_CALIBRATION`, which
+    relabels the dial; lambda itself is unchanged and the BD-rate advantage
+    stands.
 
     ``scale`` is fitted empirically and is **per component class**: see
     SPEC.md phase 4.2 for luma and the note at
@@ -943,6 +997,12 @@ def compress_array(
             raise ValueError(f"trellis_iterations must be >= 0, got {iterations}")
     else:
         iterations = 0
+
+    # Requested quality is a JPEG-equivalent target; the encoder works at the
+    # internal quality that actually achieves it, and that is what the
+    # container stores so decoding needs no knowledge of the calibration.
+    # Zero iterations means no trellis actually runs, so no correction either.
+    quality = _calibrate_quality(quality, trellis and iterations > 0)
 
     if image.ndim == 2:
         pixel_planes = [image.astype(DCT_DTYPE, copy=False)]
@@ -2147,7 +2207,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--quality",
         type=_quality_arg,
         default=50,
-        help="JPEG-like quality factor [1-100] (default: 50)",
+        help="quality [1-100], calibrated to match JPEG's scale (default: 50)",
+    )
+    p_compress.add_argument(
+        "--sampling",
+        type=int,
+        default=SAMPLING_420,
+        choices=sorted(SAMPLING_FACTORS),
+        help="chroma subsampling for colour input: 0=4:4:4, 1=4:2:2, "
+        "2=4:2:0 (default: 2, as libjpeg). Ignored for grayscale.",
     )
 
     p_decompress = subparsers.add_parser(
@@ -2165,7 +2233,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "compress":
-        compress_huffman_file(args.input, args.output, quality=args.quality)
+        compress_huffman_file(
+            args.input, args.output, quality=args.quality, sampling=args.sampling
+        )
     elif args.command == "decompress":
         decompress_huffman_file(args.input, args.output)
     else:
