@@ -11,15 +11,15 @@ JPEG-style pipeline for black-and-white (grayscale) images:
 - Quantize coefficients with a JPEG-like luminance quantization matrix
 - Entropy code with JPEG-style DC/AC symbols plus per-file Huffman tables,
   with AC symbols split across per-frequency-band context tables
-- Pack into a custom ICJ3 container
+- Pack into a custom ICJ4 container
 - Decompress by reversing the above steps
 
 Usage (CLI):
 
-    # Compress a grayscale image to the custom ICJ3 container
+    # Compress an image to the custom ICJ4 container
     python compression.py compress input.png output.icj --quality 50
 
-    # Decompress from ICJ3 back to a PNG image
+    # Decompress from ICJ4 back to a PNG image
     python compression.py decompress input.icj output.png
 
 You can also use the `compress_array` and `decompress_to_array` functions
@@ -37,11 +37,12 @@ import numpy as np
 from PIL import Image
 
 
-# Container magic. ICJ3 supersedes ICJ2 (one AC Huffman table) by splitting AC
-# coding across per-frequency-band context tables; see AC_BAND_EDGES. ICJ2
-# superseded ICJ1, whose unclamped quality byte could decode against the wrong
-# quantization matrix. No backwards compatibility is provided for either.
-MAGIC = b"ICJ3"
+# Container magic. ICJ4 adds colour (YCbCr, planar, per-class table sets).
+# ICJ3 split AC coding across per-frequency-band context tables; see
+# AC_LAYOUT_EDGES. ICJ2 superseded ICJ1, whose unclamped quality byte could
+# decode against the wrong quantization matrix. No backwards compatibility is
+# provided for any of them.
+MAGIC = b"ICJ4"
 
 # Maximum Huffman code length the container can represent. The decoder scans
 # lengths 1..MAX_CODE_LENGTH.
@@ -133,10 +134,99 @@ MAX_AC_CONTEXTS = max(AC_LAYOUT_SIZES)
 # lambda -> 0, where the DP provably reproduces the baseline bit-for-bit.
 # Only content with a monotonically rising curve can score this.
 TRELLIS_LAMBDA_SCALE = 0.030
+
+# The same constant refitted for chroma. **It does not transfer from luma**,
+# and the failure is not subtle: running chroma at the luma-derived lambda
+# costs 4.9 percentage points of BD-rate, consistently across all ten Kodak
+# images. Measured against libjpeg at 4:2:0:
+#
+#   chroma lambda multiplier   0.00    0.05    0.15    0.30    0.60    1.00
+#   mean BD-rate             -16.96  -17.18  -17.28  -16.85  -15.05  -12.36
+#
+# Note that 1.00 -- the luma formula applied unchanged -- is *worse than
+# switching trellis off entirely* (-16.96%). The cause is that lambda is tied
+# to mean(Q^2), and the chroma table is mostly 99s, so mean(Q^2) is 8125
+# against luma's 4500 at q50. The formula therefore hands chroma a **larger**
+# lambda (243.75 vs 135.01) precisely where it needs a much smaller one:
+# chroma is already coarsely quantized, so there is little redundant precision
+# left to trade for bits, and aggressive zeroing destroys what little chroma
+# signal survives.
+#
+# 0.15 of the luma scale is the optimum; the curve is flat between 0.05 and
+# 0.30, so the exact value is not delicate. Fitting beats simply disabling
+# trellis on chroma by 0.32 pp, which is why chroma keeps it rather than
+# opting out.
+TRELLIS_LAMBDA_SCALE_CHROMA = TRELLIS_LAMBDA_SCALE * 0.15
+
+# Default trellis refinement passes. Each pass re-derives the Huffman rate
+# model from the previous pass's output and re-runs the DP.
+#
+# Measured across the 11-image corpus at 512 px, BD-rate vs. libjpeg and total
+# sweep time:
+#
+#   passes    mean BD-rate    time     gain over previous
+#   1            -13.78%      4.7 s    --
+#   2            -13.94%      8.5 s    -0.163 pp for 1.80x
+#   3            -14.06%     11.9 s    -0.119 pp for 1.40x
+#
+# Held at 2 because SPEC.md locks "compression ratio over speed": dropping to
+# 1 trades 1.2% of the total compression gain for a 2x encode speedup. The
+# gain is small but consistent -- 10 of 11 images improve -- so it is a real
+# effect, not noise. An earlier single-image measurement put it at 0.07 pp and
+# suggested pass 2 was nearly free; that understated it by 2.3x, which is what
+# the multi-image corpus exists to catch.
+#
+# Callers that would rather have the encode time can pass
+# ``trellis_iterations=1``; this is likely to matter for colour, where three
+# planes multiply the cost.
 TRELLIS_ITERATIONS = 2
 
 
 BLOCK_SIZE = 8
+
+
+# --- Colour ------------------------------------------------------------------
+#
+# Chroma sampling schemes. The factors are (horizontal, vertical) decimation
+# applied to Cb and Cr; luma is never subsampled.
+SAMPLING_444 = 0
+SAMPLING_422 = 1
+SAMPLING_420 = 2
+
+SAMPLING_FACTORS = {
+    SAMPLING_444: (1, 1),
+    SAMPLING_422: (2, 1),
+    SAMPLING_420: (2, 2),
+}
+
+SAMPLING_NAMES = {
+    SAMPLING_444: "4:4:4",
+    SAMPLING_422: "4:2:2",
+    SAMPLING_420: "4:2:0",
+}
+
+# Component classes: Cb and Cr share a table set, as in JPEG.
+CLASS_LUMA = 0
+CLASS_CHROMA = 1
+COMPONENT_CLASSES = (CLASS_LUMA, CLASS_CHROMA, CLASS_CHROMA)
+
+
+# Standard JPEG chrominance quantization matrix (ISO/IEC 10918-1 Annex K.2).
+# Far coarser than the luma table beyond the lowest frequencies -- the flat
+# 99s encode the fact that the eye resolves colour detail poorly.
+STANDARD_CHROMA_Q = np.array(
+    [
+        [17, 18, 24, 47, 99, 99, 99, 99],
+        [18, 21, 26, 66, 99, 99, 99, 99],
+        [24, 26, 56, 99, 99, 99, 99, 99],
+        [47, 66, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+        [99, 99, 99, 99, 99, 99, 99, 99],
+    ],
+    dtype=np.float32,
+)
 
 
 # Standard JPEG luminance quantization matrix (ISO/IEC 10918-1 Annex K.1)
@@ -229,25 +319,58 @@ ZIGZAG_ORDER = np.array(
 
 @dataclass
 class CompressedImage:
-    """In-memory representation of a compressed grayscale image.
+    """In-memory representation of a compressed image, grayscale or colour.
 
     Attributes
     ----------
-    coeffs:
-        Quantized DCT coefficients as a 4D array of shape
-        (num_blocks_y, num_blocks_x, 8, 8), dtype=int16.
+    planes:
+        One quantized coefficient array per component, each of shape
+        (num_blocks_y, num_blocks_x, 8, 8), dtype=int16. Length 1 for
+        grayscale, 3 for YCbCr.
     orig_shape:
-        Original image shape (height, width).
-    padded_shape:
-        Padded image shape used internally (height, width).
+        Original image shape: ``(H, W)`` or ``(H, W, 3)``.
+    padded_shapes:
+        Per-plane padded pixel dimensions used internally.
     quality:
         JPEG-style quality factor in [1, 100].
+    sampling:
+        Chroma sampling scheme; see :data:`SAMPLING_FACTORS`. Meaningless for
+        grayscale, where it is recorded as :data:`SAMPLING_444`.
+
+    **No MCUs.** Because the scan is planar rather than interleaved, each
+    plane is an independent array of 8x8 blocks and pads to a multiple of 8 on
+    its own. Interleaved JPEG must instead pad luma to the 16x16 MCU so that
+    subsampled chroma lands on block boundaries -- the classic place to get
+    colour support wrong. Planar coding removes that coupling outright, which
+    is a second argument for it beyond the ~0.6% DC-prediction gain that
+    motivated the choice.
     """
 
-    coeffs: np.ndarray
-    orig_shape: Tuple[int, int]
-    padded_shape: Tuple[int, int]
+    planes: list[np.ndarray]
+    orig_shape: Tuple[int, ...]
+    padded_shapes: list[Tuple[int, int]]
     quality: int
+    sampling: int = SAMPLING_444
+
+    @property
+    def coeffs(self) -> np.ndarray:
+        """Luma coefficients. Grayscale-era alias for ``planes[0]``."""
+
+        return self.planes[0]
+
+    @property
+    def padded_shape(self) -> Tuple[int, int]:
+        """Luma padded shape. Grayscale-era alias for ``padded_shapes[0]``."""
+
+        return self.padded_shapes[0]
+
+    @property
+    def n_components(self) -> int:
+        return len(self.planes)
+
+    @property
+    def is_color(self) -> bool:
+        return len(self.planes) == 3
 
 
 # Working precision for the transform. float32 is ~2.7x faster than float64
@@ -384,14 +507,17 @@ def _quality_to_scale(quality: int) -> float:
     return scale
 
 
-def _build_quant_matrix(quality: int) -> np.ndarray:
+def _build_quant_matrix(quality: int, base: np.ndarray | None = None) -> np.ndarray:
     """Return an 8x8 quantization matrix scaled for the given quality.
 
-    Values are clipped to [1, 255] as in JPEG.
+    ``base`` defaults to the luminance table; pass :data:`STANDARD_CHROMA_Q`
+    for chroma components. Values are clipped to [1, 255] as in JPEG.
     """
 
+    if base is None:
+        base = STANDARD_LUMA_Q
     scale = _quality_to_scale(quality)
-    q = np.floor((STANDARD_LUMA_Q * scale + 50.0) / 100.0)
+    q = np.floor((base * scale + 50.0) / 100.0)
     q[q < 1] = 1
     q[q > 255] = 255
     return q.astype(np.float32)
@@ -533,7 +659,7 @@ def _trellis_quantize(
     return out.reshape(by, bx, BLOCK_SIZE, BLOCK_SIZE).astype(np.int16)
 
 
-def _trellis_lambda(Q: np.ndarray) -> float:
+def _trellis_lambda(Q: np.ndarray, scale: float = TRELLIS_LAMBDA_SCALE) -> float:
     """Lagrange multiplier for a given quantization matrix.
 
     Rate-distortion theory puts the optimum at ``lambda = -dD/dR``; for a
@@ -543,10 +669,139 @@ def _trellis_lambda(Q: np.ndarray) -> float:
     simply becomes cheaper in bits -- rather than introducing a second knob
     that silently slides along the rate-distortion curve.
 
-    The constant is fitted empirically; see SPEC.md phase 4.2.
+    ``scale`` is fitted empirically and is **per component class**: see
+    SPEC.md phase 4.2 for luma and the note at
+    :data:`TRELLIS_LAMBDA_SCALE_CHROMA` for why chroma needs its own. The
+    ``mean(Q^2)`` proportionality holds within a class but does not carry
+    across them.
     """
 
-    return TRELLIS_LAMBDA_SCALE * float(np.mean(Q.astype(np.float64) ** 2))
+    return scale * float(np.mean(Q.astype(np.float64) ** 2))
+
+
+# BT.601 full-range, the JPEG/JFIF convention. Rows map RGB -> Y, Cb, Cr;
+# chroma is offset by 128 so all three planes share the [0, 255] domain the
+# rest of the pipeline assumes.
+_RGB_TO_YCBCR = np.array(
+    [
+        [0.299, 0.587, 0.114],
+        [-0.168736, -0.331264, 0.5],
+        [0.5, -0.418688, -0.081312],
+    ],
+    dtype=np.float32,
+)
+
+_YCBCR_TO_RGB = np.array(
+    [
+        [1.0, 0.0, 1.402],
+        [1.0, -0.344136, -0.714136],
+        [1.0, 1.772, 0.0],
+    ],
+    dtype=np.float32,
+)
+
+
+def _rgb_to_ycbcr(rgb: np.ndarray) -> np.ndarray:
+    """Convert an (H, W, 3) RGB array to float32 YCbCr, chroma offset by 128."""
+
+    out = rgb.astype(DCT_DTYPE, copy=False) @ _RGB_TO_YCBCR.T
+    out[..., 1:] += DCT_DTYPE(128.0)
+    return out
+
+
+def _ycbcr_to_rgb(ycbcr: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`_rgb_to_ycbcr`, clipped to uint8."""
+
+    shifted = ycbcr.astype(DCT_DTYPE, copy=False).copy()
+    shifted[..., 1:] -= DCT_DTYPE(128.0)
+    rgb = shifted @ _YCBCR_TO_RGB.T
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
+def _subsample(plane: np.ndarray, hs: int, vs: int) -> np.ndarray:
+    """Decimate a plane by ``(hs, vs)`` using box averaging.
+
+    Averaging rather than dropping samples: a box filter is the matched
+    decimation prefilter, and point-sampling chroma aliases badly on saturated
+    edges. Odd dimensions are edge-padded first so the box always has full
+    support.
+    """
+
+    if hs == 1 and vs == 1:
+        return plane
+
+    h, w = plane.shape
+    pad_h = (vs - h % vs) % vs
+    pad_w = (hs - w % hs) % hs
+    if pad_h or pad_w:
+        plane = np.pad(plane, ((0, pad_h), (0, pad_w)), mode="edge")
+
+    h, w = plane.shape
+    return plane.reshape(h // vs, vs, w // hs, hs).mean(axis=(1, 3))
+
+
+def _upsample(plane: np.ndarray, hs: int, vs: int, shape: Tuple[int, int]) -> np.ndarray:
+    """Inverse of :func:`_subsample`, to exactly ``shape``.
+
+    Bilinear, with half-sample-offset centres so reconstructed chroma sits
+    where the box filter took it from rather than shifted by half a chroma
+    sample. libjpeg's "fancy upsampling" is the same idea; the triangle filter
+    here is within noise of it and far simpler. Nearest-neighbour was measured
+    and is visibly worse on colour edges.
+    """
+
+    if hs == 1 and vs == 1:
+        return plane[: shape[0], : shape[1]]
+
+    h, w = plane.shape
+    target_h, target_w = shape
+
+    # Sample positions of the output grid in input coordinates.
+    ys = (np.arange(target_h, dtype=np.float32) + 0.5) / vs - 0.5
+    xs = (np.arange(target_w, dtype=np.float32) + 0.5) / hs - 0.5
+    ys = np.clip(ys, 0, h - 1)
+    xs = np.clip(xs, 0, w - 1)
+
+    y0 = np.floor(ys).astype(np.int64)
+    x0 = np.floor(xs).astype(np.int64)
+    y1 = np.minimum(y0 + 1, h - 1)
+    x1 = np.minimum(x0 + 1, w - 1)
+    wy = (ys - y0)[:, None]
+    wx = (xs - x0)[None, :]
+
+    top = plane[y0][:, x0] * (1 - wx) + plane[y0][:, x1] * wx
+    bottom = plane[y1][:, x0] * (1 - wx) + plane[y1][:, x1] * wx
+    return top * (1 - wy) + bottom * wy
+
+
+def _plane_shapes(
+    h: int, w: int, sampling: int, n_components: int
+) -> list[Tuple[int, int]]:
+    """Unpadded pixel dimensions of each component plane."""
+
+    if n_components == 1:
+        return [(h, w)]
+
+    hs, vs = SAMPLING_FACTORS[sampling]
+    ch = (h + vs - 1) // vs
+    cw = (w + hs - 1) // hs
+    return [(h, w), (ch, cw), (ch, cw)]
+
+
+def _load_image(path: str) -> np.ndarray:
+    """Load an image as uint8: (H, W) if greyscale on disk, else (H, W, 3).
+
+    Mode ``P`` with transparency is routed through RGBA first, as Pillow warns
+    when compositing an undefined background straight to another mode; alpha
+    is irrelevant to this codec and is dropped explicitly.
+    """
+
+    with Image.open(path) as im:
+        if im.mode == "P" and "transparency" in im.info:
+            im = im.convert("RGBA")
+        if im.mode in ("L", "1", "I;16", "I"):
+            return np.array(im.convert("L"), dtype=np.uint8)
+        return np.array(im.convert("RGB"), dtype=np.uint8)
 
 
 def _load_grayscale(path: str) -> np.ndarray:
@@ -596,16 +851,69 @@ def _ac_bit_costs(ac_table: dict[int, tuple[int, int]]) -> np.ndarray:
     return bits
 
 
+def _compress_plane(
+    plane: np.ndarray,
+    Q: np.ndarray,
+    trellis: bool,
+    iterations: int,
+    lambda_scale: float = TRELLIS_LAMBDA_SCALE,
+) -> tuple[np.ndarray, Tuple[int, int]]:
+    """Transform, quantize and optionally trellis-optimize a single plane."""
+
+    padded, padded_shape = _pad_to_block_size(plane, BLOCK_SIZE)
+    padded = padded - DCT_DTYPE(128.0)
+
+    blocks = _to_blocks(padded, BLOCK_SIZE)
+    dct = _forward_dct_2d(blocks)
+    coeffs = np.round(dct / Q).astype(np.int16)
+
+    if trellis:
+        lam = _trellis_lambda(Q, lambda_scale)
+        # The rate model needs Huffman costs, which come from the symbol
+        # distribution -- which trellis then changes. Re-deriving the tables
+        # and re-running closes that loop; iterating is bounded and keeps the
+        # best result seen, since convergence is not guaranteed.
+        for _ in range(iterations):
+            ac_bits = _ac_bit_costs(_marginal_ac_table(coeffs))
+            candidate = _trellis_quantize(dct.astype(np.float64), Q, ac_bits, lam)
+            if np.array_equal(candidate, coeffs):
+                break
+            coeffs = candidate
+
+    return coeffs, padded_shape
+
+
+def _decompress_plane(
+    coeffs: np.ndarray, Q: np.ndarray, shape: Tuple[int, int]
+) -> np.ndarray:
+    """Dequantize and inverse-transform one plane, cropped to ``shape``."""
+
+    blocks = _inverse_dct_2d(coeffs.astype(DCT_DTYPE) * Q)
+    padded = _from_blocks(blocks, BLOCK_SIZE) + DCT_DTYPE(128.0)
+    return padded[: shape[0], : shape[1]]
+
+
+def _quant_matrix_for(component_class: int, quality: int) -> np.ndarray:
+    """Quantization matrix for a component class, scaled for ``quality``."""
+
+    base = STANDARD_LUMA_Q if component_class == CLASS_LUMA else STANDARD_CHROMA_Q
+    return _build_quant_matrix(quality, base).astype(DCT_DTYPE)
+
+
 def compress_array(
-    image: np.ndarray, quality: int = 50, trellis: bool = True
+    image: np.ndarray,
+    quality: int = 50,
+    trellis: bool = True,
+    trellis_iterations: int | None = None,
+    sampling: int = SAMPLING_420,
 ) -> CompressedImage:
-    """Compress a 2D grayscale image array using JPEG-like DCT + quantization.
+    """Compress a grayscale or RGB image using JPEG-like DCT + quantization.
 
     Parameters
     ----------
     image:
-        2D array of shape (H, W), values in [0, 255]. Other dtypes will be
-        converted to float32 internally.
+        ``(H, W)`` grayscale or ``(H, W, 3)`` RGB, values in [0, 255]. Other
+        dtypes are converted to float32 internally.
     quality:
         JPEG-like quality factor in [1, 100]. Higher means better quality and
         less compression.
@@ -613,66 +921,112 @@ def compress_array(
         Enable rate-distortion optimized quantization. Encoder-side only --
         the output is an ordinary coefficient array, so the decoder and the
         container format are unaffected.
-    """
+    trellis_iterations:
+        Refinement passes, defaulting to :data:`TRELLIS_ITERATIONS`. Each pass
+        roughly doubles encode time for a diminishing rate gain; see the
+        measurements at that constant. Ignored when ``trellis`` is False.
+    sampling:
+        Chroma subsampling for colour input: :data:`SAMPLING_420` (default),
+        :data:`SAMPLING_422` or :data:`SAMPLING_444`. Ignored for grayscale.
 
-    if image.ndim != 2:
-        raise ValueError("compress_array expects a 2D grayscale image")
+    The grayscale path is bit-identical to the pre-colour codec; colour is
+    strictly additive.
+    """
 
     quality = _clamp_quality(quality)
 
-    orig_shape = image.shape
-    img = image.astype(DCT_DTYPE, copy=False)
-
-    # Pad to full blocks and level shift
-    padded, padded_shape = _pad_to_block_size(img, BLOCK_SIZE)
-    padded = padded - DCT_DTYPE(128.0)
-
-    Q = _build_quant_matrix(quality).astype(DCT_DTYPE)
-
-    blocks = _to_blocks(padded, BLOCK_SIZE)
-    dct = _forward_dct_2d(blocks)
-    coeffs = np.round(dct / Q).astype(np.int16)
-
     if trellis:
-        lam = _trellis_lambda(Q)
-        # The rate model needs Huffman costs, which come from the symbol
-        # distribution -- which trellis then changes. Re-deriving the tables
-        # and re-running closes that loop; iterating is bounded and keeps the
-        # best result seen, since convergence is not guaranteed.
-        for _ in range(TRELLIS_ITERATIONS):
-            ac_bits = _ac_bit_costs(_marginal_ac_table(coeffs))
-            candidate = _trellis_quantize(dct.astype(np.float64), Q, ac_bits, lam)
-            if np.array_equal(candidate, coeffs):
-                break
-            coeffs = candidate
+        iterations = (
+            TRELLIS_ITERATIONS if trellis_iterations is None else int(trellis_iterations)
+        )
+        if iterations < 0:
+            raise ValueError(f"trellis_iterations must be >= 0, got {iterations}")
+    else:
+        iterations = 0
+
+    if image.ndim == 2:
+        pixel_planes = [image.astype(DCT_DTYPE, copy=False)]
+        sampling = SAMPLING_444
+    elif image.ndim == 3 and image.shape[2] == 3:
+        if sampling not in SAMPLING_FACTORS:
+            raise ValueError(
+                f"sampling must be one of {sorted(SAMPLING_FACTORS)}, got {sampling}"
+            )
+        ycbcr = _rgb_to_ycbcr(image)
+        hs, vs = SAMPLING_FACTORS[sampling]
+        pixel_planes = [
+            ycbcr[..., 0],
+            _subsample(ycbcr[..., 1], hs, vs),
+            _subsample(ycbcr[..., 2], hs, vs),
+        ]
+    else:
+        raise ValueError(
+            "compress_array expects (H, W) grayscale or (H, W, 3) RGB, got "
+            f"shape {image.shape}"
+        )
+
+    n_components = len(pixel_planes)
+    planes, padded_shapes = [], []
+    for index, plane in enumerate(pixel_planes):
+        cls = COMPONENT_CLASSES[index] if n_components == 3 else CLASS_LUMA
+        scale = (
+            TRELLIS_LAMBDA_SCALE
+            if cls == CLASS_LUMA
+            else TRELLIS_LAMBDA_SCALE_CHROMA
+        )
+        coeffs, padded_shape = _compress_plane(
+            plane, _quant_matrix_for(cls, quality), trellis, iterations, scale
+        )
+        planes.append(coeffs)
+        padded_shapes.append(padded_shape)
 
     return CompressedImage(
-        coeffs=coeffs,
-        orig_shape=orig_shape,
-        padded_shape=padded_shape,
+        planes=planes,
+        orig_shape=image.shape,
+        padded_shapes=padded_shapes,
         quality=int(quality),
+        sampling=sampling,
     )
 
 
 def decompress_to_array(comp: CompressedImage) -> np.ndarray:
-    """Decompress a :class:`CompressedImage` back to a uint8 grayscale array."""
+    """Decompress a :class:`CompressedImage` to a uint8 array.
 
-    by, bx, _, _ = comp.coeffs.shape
-    h_p, w_p = comp.padded_shape
-    h, w = comp.orig_shape
+    Returns ``(H, W)`` for grayscale, ``(H, W, 3)`` RGB for colour.
+    """
 
-    if h_p != by * BLOCK_SIZE or w_p != bx * BLOCK_SIZE:
-        raise ValueError("Inconsistent block/padded shapes in compressed data")
+    h, w = comp.orig_shape[0], comp.orig_shape[1]
+    shapes = _plane_shapes(h, w, comp.sampling, comp.n_components)
 
-    Q = _build_quant_matrix(comp.quality).astype(DCT_DTYPE)
+    for index, (coeffs, padded_shape) in enumerate(
+        zip(comp.planes, comp.padded_shapes)
+    ):
+        by, bx = coeffs.shape[:2]
+        if padded_shape != (by * BLOCK_SIZE, bx * BLOCK_SIZE):
+            raise ValueError(
+                f"Inconsistent block/padded shapes for component {index}"
+            )
 
-    blocks = _inverse_dct_2d(comp.coeffs.astype(DCT_DTYPE) * Q)
-    padded = _from_blocks(blocks, BLOCK_SIZE) + DCT_DTYPE(128.0)
+    decoded = []
+    for index, coeffs in enumerate(comp.planes):
+        cls = COMPONENT_CLASSES[index] if comp.n_components == 3 else CLASS_LUMA
+        decoded.append(
+            _decompress_plane(coeffs, _quant_matrix_for(cls, comp.quality), shapes[index])
+        )
 
-    # Crop back to original shape and clip to valid range
-    img = padded[:h, :w]
-    img = np.clip(img, 0, 255).astype(np.uint8)
-    return img
+    if comp.n_components == 1:
+        return np.clip(decoded[0], 0, 255).astype(np.uint8)
+
+    hs, vs = SAMPLING_FACTORS[comp.sampling]
+    ycbcr = np.stack(
+        [
+            decoded[0],
+            _upsample(decoded[1], hs, vs, (h, w)),
+            _upsample(decoded[2], hs, vs, (h, w)),
+        ],
+        axis=-1,
+    )
+    return _ycbcr_to_rgb(ycbcr)
 
 
 # === Huffman-based entropy coding (custom container) ========================
@@ -1026,7 +1380,7 @@ def _build_ac_context_tables(
 
 
 def _ac_layout_cost(
-    stream: _SymbolStream, layout: int
+    symbols: np.ndarray, positions: np.ndarray, layout: int
 ) -> tuple[float, list[dict[int, tuple[int, int]]]]:
     """Total bytes -- code bits plus serialized tables -- for one band layout.
 
@@ -1034,19 +1388,20 @@ def _ac_layout_cost(
     on small images. Scoring code bits alone would always prefer the finest
     split, which is exactly the mistake that makes a 256px image at q10 come
     out 7% *larger*.
+
+    Takes raw ``(symbols, positions)`` rather than a stream so that a whole
+    component class -- Cb and Cr together -- can be priced as one table set.
     """
 
-    contexts = stream.contexts(layout)
-    tables = _build_ac_context_tables(
-        stream.ac_symbols, contexts, AC_LAYOUT_SIZES[layout]
-    )
+    contexts = AC_LAYOUTS[layout][positions]
+    tables = _build_ac_context_tables(symbols, contexts, AC_LAYOUT_SIZES[layout])
 
     bits = 0
     table_bytes = 0
     for ctx, table in enumerate(tables):
         if not table:
             continue
-        counts = np.bincount(stream.ac_symbols[contexts == ctx], minlength=256)
+        counts = np.bincount(symbols[contexts == ctx], minlength=256)
         bits += sum(int(counts[sym]) * n for sym, (_cd, n) in table.items())
         table_bytes += len(_serialize_huffman_table(table))
 
@@ -1054,18 +1409,18 @@ def _ac_layout_cost(
 
 
 def _choose_ac_layout(
-    stream: _SymbolStream,
+    symbols: np.ndarray, positions: np.ndarray
 ) -> tuple[int, list[dict[int, tuple[int, int]]]]:
-    """Pick the band layout that costs the fewest bytes on this image.
+    """Pick the band layout that costs the fewest bytes for this symbol set.
 
     Ties go to the coarser layout, which keeps the container smaller and the
     decoder's table build cheaper for no rate cost.
     """
 
     best_layout = 0
-    best_cost, best_tables = _ac_layout_cost(stream, 0)
+    best_cost, best_tables = _ac_layout_cost(symbols, positions, 0)
     for layout in range(1, len(AC_LAYOUTS)):
-        cost, tables = _ac_layout_cost(stream, layout)
+        cost, tables = _ac_layout_cost(symbols, positions, layout)
         if cost < best_cost:
             best_layout, best_cost, best_tables = layout, cost, tables
     return best_layout, best_tables
@@ -1085,41 +1440,45 @@ def _ac_tables_to_arrays(
     return code, length
 
 
-def _encode_blocks_huffman(
-    coeffs: np.ndarray,
-) -> tuple[bytes, dict[int, tuple[int, int]], list[dict[int, tuple[int, int]]], int]:
-    """Run JPEG-like DC/AC coding + Huffman on quantized blocks.
+@dataclass
+class _ClassTables:
+    """The Huffman table set shared by every component of one class."""
 
-    Parameters
-    ----------
-    coeffs:
-        Quantized DCT coefficients, shape (blocks_y, blocks_x, 8, 8), int16.
+    dc_table: dict[int, tuple[int, int]]
+    layout: int
+    ac_tables: list[dict[int, tuple[int, int]]]
 
-    Returns
-    -------
-    bitstream:
-        Huffman-coded bitstream.
-    dc_table:
-        Huffman table for DC categories (0-11).
-    ac_tables:
-        One Huffman table for AC symbols (0-255) per context of the chosen
-        band layout; see :data:`AC_LAYOUT_EDGES`.
-    layout:
-        Index into :data:`AC_LAYOUTS` of the band layout that priced cheapest.
+
+def _build_class_tables(streams: list[_SymbolStream]) -> _ClassTables:
+    """Derive one table set from the pooled symbols of a component class.
+
+    Cb and Cr are pooled rather than given a table each, as in JPEG: their
+    statistics are near-identical, so two table sets would roughly double
+    table cost to buy almost nothing.
     """
 
-    stream = _scan_symbols(coeffs)
+    dc_cats = np.concatenate([s.dc_cats for s in streams])
+    ac_symbols = np.concatenate([s.ac_symbols for s in streams])
+    ac_positions = np.concatenate([s.ac_positions for s in streams])
 
-    # First pass: symbol frequencies -> optimal per-image Huffman tables.
-    dc_counts = np.bincount(stream.dc_cats, minlength=12)
+    dc_counts = np.bincount(dc_cats, minlength=12)
     dc_table = _build_huffman_table({i: int(n) for i, n in enumerate(dc_counts)})
-    layout, ac_tables = _choose_ac_layout(stream)
-    ac_contexts = stream.contexts(layout)
+    layout, ac_tables = _choose_ac_layout(ac_symbols, ac_positions)
+    return _ClassTables(dc_table=dc_table, layout=layout, ac_tables=ac_tables)
 
-    # Second pass: emit. Per block the layout is
-    #   [DC code][DC mantissa]  then  [AC symbol][AC mantissa] * n_ac
-    dc_code, dc_len = _table_to_arrays(dc_table, 12)
-    ac_code, ac_len = _ac_tables_to_arrays(ac_tables)
+
+def _emit_plane(
+    stream: _SymbolStream, tables: _ClassTables
+) -> tuple[np.ndarray, np.ndarray]:
+    """Codes and lengths for one plane, in emission order.
+
+    Per block the layout is
+    ``[DC code][DC mantissa]`` then ``[AC symbol][AC mantissa] * n_ac``.
+    """
+
+    dc_code, dc_len = _table_to_arrays(tables.dc_table, 12)
+    ac_code, ac_len = _ac_tables_to_arrays(tables.ac_tables)
+    ac_contexts = stream.contexts(tables.layout)
 
     n_ac = np.bincount(stream.ac_block, minlength=stream.n_blocks)
     per_block = 2 + 2 * n_ac
@@ -1142,7 +1501,49 @@ def _encode_blocks_huffman(
     codes[idx + 1] = _value_to_bits_vec(stream.ac_values, stream.ac_sizes)
     lengths[idx + 1] = stream.ac_sizes
 
-    return _pack_bits(codes, lengths), dc_table, ac_tables, layout
+    return codes, lengths
+
+
+def _encode_planes(
+    planes: list[np.ndarray], classes: tuple[int, ...]
+) -> tuple[bytes, list[_ClassTables]]:
+    """Entropy-code every plane into one bitstream, planar order.
+
+    Planes are emitted back to back -- all of Y, then all of Cb, then all of
+    Cr -- rather than interleaved into MCUs. Each plane restarts its own DC
+    predictor, which is what :func:`_scan_symbols` already does per call.
+    """
+
+    streams = [_scan_symbols(p) for p in planes]
+
+    n_classes = max(classes) + 1
+    table_sets = [
+        _build_class_tables([streams[i] for i, c in enumerate(classes) if c == cls])
+        for cls in range(n_classes)
+    ]
+
+    codes, lengths = [], []
+    for stream, cls in zip(streams, classes):
+        plane_codes, plane_lengths = _emit_plane(stream, table_sets[cls])
+        codes.append(plane_codes)
+        lengths.append(plane_lengths)
+
+    return (
+        _pack_bits(np.concatenate(codes), np.concatenate(lengths)),
+        table_sets,
+    )
+
+
+def _encode_blocks_huffman(
+    coeffs: np.ndarray,
+) -> tuple[bytes, dict[int, tuple[int, int]], list[dict[int, tuple[int, int]]], int]:
+    """Single-plane entropy coding. Thin wrapper over :func:`_encode_planes`.
+
+    Returns ``(bitstream, dc_table, ac_tables, layout)``.
+    """
+
+    bitstream, (tables,) = _encode_planes([coeffs], (CLASS_LUMA,))
+    return bitstream, tables.dc_table, tables.ac_tables, tables.layout
 
 
 def _table_to_arrays(table: dict[int, tuple[int, int]], size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1220,17 +1621,15 @@ def _decode_long_code(read_bit, long_codes: dict[tuple[int, int], int], what: st
     raise ValueError(f"Failed to decode {what}")
 
 
-def _decode_blocks_huffman(
-    by: int,
-    bx: int,
+def _decode_planes(
+    block_shapes: list[Tuple[int, int]],
+    classes: tuple[int, ...],
     bitstream: bytes,
-    dc_table: dict[int, tuple[int, int]],
-    ac_tables: list[dict[int, tuple[int, int]]],
-    layout: int,
-) -> np.ndarray:
-    """Inverse of :func:`_encode_blocks_huffman`.
+    table_sets: list[_ClassTables],
+) -> list[np.ndarray]:
+    """Inverse of :func:`_encode_planes`.
 
-    Returns an array of shape (by, bx, 8, 8) with quantized coefficients.
+    Returns one ``(by, bx, 8, 8)`` array per plane.
 
     The AC table is selected per symbol by ``AC_LAYOUTS[layout]`` indexed with
     ``k``, the position about to be filled. ``k`` is known before the symbol is
@@ -1257,13 +1656,21 @@ def _decode_blocks_huffman(
     reference decoder and asserts the two agree bit for bit.
     """
 
-    dc_lut = _build_decode_lut(dc_table)
-    if dc_lut is None:
-        raise ValueError("Container has an empty DC table")
-    dc_sym, dc_len, dc_long = dc_lut
+    # One decode structure per class, built once and reused across the planes
+    # that share it.
+    class_luts = []
+    for tables in table_sets:
+        dc_lut = _build_decode_lut(tables.dc_table)
+        if dc_lut is None:
+            raise ValueError("Container has an empty DC table")
+        class_luts.append(
+            (
+                dc_lut,
+                [_build_decode_lut(t) for t in tables.ac_tables],
+                AC_LAYOUTS[tables.layout].tolist(),
+            )
+        )
 
-    luts = [_build_decode_lut(t) for t in ac_tables]
-    band = AC_LAYOUTS[layout].tolist()
     zigzag = ZIGZAG_ORDER.tolist()
 
     data = bitstream
@@ -1294,58 +1701,20 @@ def _decode_blocks_huffman(
         acc &= (1 << nb) - 1
         return bit
 
-    rows: list[list[int]] = []
-    prev_dc = 0
+    out_planes: list[np.ndarray] = []
 
-    for _ in range(by * bx):
-        flat = [0] * 64
+    for (by, bx), cls in zip(block_shapes, classes):
+        (dc_sym, dc_len, dc_long), luts, band = class_luts[cls]
 
-        # --- DC ---
-        while nb < window_bits:
-            if pos < limit:
-                byte = data[pos]
-            elif pos < hard_end:
-                byte = 0
-            else:
-                raise EOFError("Unexpected end of bitstream")
-            pos += 1
-            acc = (acc << 8) | byte
-            nb += 8
+        rows: list[list[int]] = []
+        # Each plane restarts its own DC predictor, matching the encoder's
+        # per-plane scan.
+        prev_dc = 0
 
-        w = (acc >> (nb - window_bits)) & window_mask
-        cat = dc_sym[w]
-        if cat >= 0:
-            nb -= dc_len[w]
-            acc &= (1 << nb) - 1
-        else:
-            cat = _decode_long_code(_read_bit, dc_long, "DC coefficient")
+        for _ in range(by * bx):
+            flat = [0] * 64
 
-        if cat:
-            while nb < cat:
-                if pos < limit:
-                    byte = data[pos]
-                elif pos < hard_end:
-                    byte = 0
-                else:
-                    raise EOFError("Unexpected end of bitstream")
-                pos += 1
-                acc = (acc << 8) | byte
-                nb += 8
-            nb -= cat
-            bits = (acc >> nb) & ((1 << cat) - 1)
-            acc &= (1 << nb) - 1
-            prev_dc += bits if bits >= (1 << (cat - 1)) else bits - ((1 << cat) - 1)
-
-        flat[zigzag[0]] = prev_dc
-
-        # --- AC ---
-        k = 1
-        while k < 64:
-            lut = luts[band[k]]
-            if lut is None:
-                raise ValueError("AC stream references an unused context")
-            ac_sym, ac_len, ac_long = lut
-
+            # --- DC ---
             while nb < window_bits:
                 if pos < limit:
                     byte = data[pos]
@@ -1358,28 +1727,15 @@ def _decode_blocks_huffman(
                 nb += 8
 
             w = (acc >> (nb - window_bits)) & window_mask
-            symbol = ac_sym[w]
-            if symbol >= 0:
-                nb -= ac_len[w]
+            cat = dc_sym[w]
+            if cat >= 0:
+                nb -= dc_len[w]
                 acc &= (1 << nb) - 1
             else:
-                symbol = _decode_long_code(_read_bit, ac_long, "AC coefficient")
+                cat = _decode_long_code(_read_bit, dc_long, "DC coefficient")
 
-            if symbol == 0x00:          # EOB
-                break
-            if symbol == 0xF0:          # ZRL
-                k += 16
-                if k > 64:
-                    raise ValueError("ZRL went past end of block")
-                continue
-
-            k += symbol >> 4
-            if k >= 64:
-                raise ValueError("Run-length went past end of block")
-
-            size = symbol & 0x0F
-            if size:
-                while nb < size:
+            if cat:
+                while nb < cat:
                     if pos < limit:
                         byte = data[pos]
                     elif pos < hard_end:
@@ -1389,17 +1745,93 @@ def _decode_blocks_huffman(
                     pos += 1
                     acc = (acc << 8) | byte
                     nb += 8
-                nb -= size
-                bits = (acc >> nb) & ((1 << size) - 1)
+                nb -= cat
+                bits = (acc >> nb) & ((1 << cat) - 1)
                 acc &= (1 << nb) - 1
-                flat[zigzag[k]] = (
-                    bits if bits >= (1 << (size - 1)) else bits - ((1 << size) - 1)
-                )
-            k += 1
+                prev_dc += bits if bits >= (1 << (cat - 1)) else bits - ((1 << cat) - 1)
 
-        rows.append(flat)
+            flat[zigzag[0]] = prev_dc
 
-    return np.array(rows, dtype=np.int16).reshape(by, bx, BLOCK_SIZE, BLOCK_SIZE)
+            # --- AC ---
+            k = 1
+            while k < 64:
+                lut = luts[band[k]]
+                if lut is None:
+                    raise ValueError("AC stream references an unused context")
+                ac_sym, ac_len, ac_long = lut
+
+                while nb < window_bits:
+                    if pos < limit:
+                        byte = data[pos]
+                    elif pos < hard_end:
+                        byte = 0
+                    else:
+                        raise EOFError("Unexpected end of bitstream")
+                    pos += 1
+                    acc = (acc << 8) | byte
+                    nb += 8
+
+                w = (acc >> (nb - window_bits)) & window_mask
+                symbol = ac_sym[w]
+                if symbol >= 0:
+                    nb -= ac_len[w]
+                    acc &= (1 << nb) - 1
+                else:
+                    symbol = _decode_long_code(_read_bit, ac_long, "AC coefficient")
+
+                if symbol == 0x00:          # EOB
+                    break
+                if symbol == 0xF0:          # ZRL
+                    k += 16
+                    if k > 64:
+                        raise ValueError("ZRL went past end of block")
+                    continue
+
+                k += symbol >> 4
+                if k >= 64:
+                    raise ValueError("Run-length went past end of block")
+
+                size = symbol & 0x0F
+                if size:
+                    while nb < size:
+                        if pos < limit:
+                            byte = data[pos]
+                        elif pos < hard_end:
+                            byte = 0
+                        else:
+                            raise EOFError("Unexpected end of bitstream")
+                        pos += 1
+                        acc = (acc << 8) | byte
+                        nb += 8
+                    nb -= size
+                    bits = (acc >> nb) & ((1 << size) - 1)
+                    acc &= (1 << nb) - 1
+                    flat[zigzag[k]] = (
+                        bits if bits >= (1 << (size - 1)) else bits - ((1 << size) - 1)
+                    )
+                k += 1
+
+            rows.append(flat)
+
+        out_planes.append(
+            np.array(rows, dtype=np.int16).reshape(by, bx, BLOCK_SIZE, BLOCK_SIZE)
+        )
+
+    return out_planes
+
+
+def _decode_blocks_huffman(
+    by: int,
+    bx: int,
+    bitstream: bytes,
+    dc_table: dict[int, tuple[int, int]],
+    ac_tables: list[dict[int, tuple[int, int]]],
+    layout: int,
+) -> np.ndarray:
+    """Single-plane decode. Thin wrapper over :func:`_decode_planes`."""
+
+    tables = _ClassTables(dc_table=dc_table, layout=layout, ac_tables=ac_tables)
+    return _decode_planes([(by, bx)], (CLASS_LUMA,), bitstream, [tables])[0]
 
 
 def _read_exactly(f, n: int) -> bytes:
@@ -1482,21 +1914,97 @@ def _read_huffman_table(f) -> dict[int, tuple[int, int]]:
     )
 
 
-def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) -> None:
+def _block_shapes(padded_shapes: list[Tuple[int, int]]) -> list[Tuple[int, int]]:
+    """Block dimensions implied by padded pixel dimensions."""
+
+    return [(h // BLOCK_SIZE, w // BLOCK_SIZE) for h, w in padded_shapes]
+
+
+def _padded_shapes_for(
+    h: int, w: int, sampling: int, n_components: int
+) -> list[Tuple[int, int]]:
+    """Padded plane dimensions, derived rather than stored.
+
+    ICJ3 wrote ``blocks_y``/``blocks_x`` into the header even though both are
+    a pure function of the image dimensions. ICJ4 drops them, which is what
+    lets a colour-capable container be *smaller* than its grayscale-only
+    predecessor rather than larger.
+    """
+
+    def pad(n: int) -> int:
+        return ((n + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+
+    return [
+        (pad(ph), pad(pw))
+        for ph, pw in _plane_shapes(h, w, sampling, n_components)
+    ]
+
+
+def _write_class_tables(header: bytearray, tables: _ClassTables) -> None:
+    """Append one class's table set to a container header."""
+
+    # Tables are self-delimiting -- each opens with its own symbol count -- so
+    # no byte-length prefix is stored.
+    header.extend(_serialize_huffman_table(tables.dc_table))
+
+    # Only contexts that actually occur are written, identified by a bitmap.
+    # Serialising every context unconditionally would spend 2 bytes apiece on
+    # empty tables, which is pure overhead on an image that uses few bands --
+    # the regime phase 4.1 was written to protect.
+    header.append(tables.layout & 0xFF)
+    present = 0
+    for ctx, table in enumerate(tables.ac_tables):
+        if table:
+            present |= 1 << ctx
+    header.extend(present.to_bytes(2, "big"))
+    for table in tables.ac_tables:
+        if table:
+            header.extend(_serialize_huffman_table(table))
+
+
+def _read_class_tables(f) -> _ClassTables:
+    """Inverse of :func:`_write_class_tables`."""
+
+    dc_table = _read_huffman_table(f)
+
+    layout = _read_exactly(f, 1)[0]
+    if layout >= len(AC_LAYOUTS):
+        raise ValueError(
+            f"Container declares AC band layout {layout}, but this build "
+            f"defines only {len(AC_LAYOUTS)}. The layout table is part of "
+            "the format; a file written against a different "
+            "AC_LAYOUT_EDGES cannot be decoded."
+        )
+
+    present = int.from_bytes(_read_exactly(f, 2), "big")
+    ac_tables = [
+        _read_huffman_table(f) if present & (1 << ctx) else {}
+        for ctx in range(AC_LAYOUT_SIZES[layout])
+    ]
+    return _ClassTables(dc_table=dc_table, layout=layout, ac_tables=ac_tables)
+
+
+def compress_huffman_file(
+    input_path: str,
+    output_path: str,
+    quality: int = 50,
+    sampling: int = SAMPLING_420,
+) -> None:
     """Compress an image using DCT + quantization + Huffman into a custom binary.
 
-    The ICJ3 container format is::
+    The ICJ4 container format is::
 
-        magic:      4 bytes   ASCII 'ICJ3'
+        magic:      4 bytes   ASCII 'ICJ4'
         height:     4 bytes   unsigned big-endian
         width:      4 bytes   unsigned big-endian
         quality:    1 byte    1-100 (always clamped before writing)
-        blocks_y:   2 bytes   unsigned big-endian
-        blocks_x:   2 bytes   unsigned big-endian
-        dc_table:   self-delimiting (see below)
-        layout:     1 byte    index into AC_LAYOUT_EDGES, chosen per image
-        present:    2 bytes   bitmap, bit i set if context i has a table
-        ac_tables:  one self-delimiting table per set bit, in context order
+        format:     1 byte    high nibble = component count (1 or 3)
+                              low nibble  = chroma sampling scheme
+        per class:  table set (1 class for grayscale, 2 for colour)
+            dc_table:   self-delimiting (see below)
+            layout:     1 byte   index into AC_LAYOUT_EDGES
+            present:    2 bytes  bitmap, bit i set if context i has a table
+            ac_tables:  one self-delimiting table per set bit
         bit_len:    4 bytes   length of following bitstream in bytes
         bitstream:  bit_len bytes, big-endian bit packing, zero-padded
 
@@ -1509,49 +2017,36 @@ def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) 
     empty tables, which would otherwise be pure overhead on an image that
     uses few bands.
 
-    ICJ3 replaced ICJ2's single AC table with one table per frequency band,
-    with the band layout priced per image and recorded in ``layout``. Layout 0
-    is a single table -- ICJ2's behaviour -- so ICJ3 is never worse. The
-    layout table is part of the format: ``layout`` is range-checked on load,
-    so a file written against a different :data:`AC_LAYOUT_EDGES` is rejected
-    rather than silently mis-decoded.
+    Block dimensions are **not** stored: they follow from the image size and
+    sampling scheme. Dropping those redundant fields is what makes ICJ4
+    smaller than ICJ3 on grayscale despite gaining a format byte, so colour
+    support costs the grayscale path nothing.
+
+    The scan is **planar**: all of Y, then all of Cb, then all of Cr, each
+    restarting its own DC predictor. Cb and Cr share one table set, as in
+    JPEG. See :class:`CompressedImage` on why planar removes the MCU-padding
+    coupling entirely.
     """
 
-    arr = _load_grayscale(input_path)
-    comp = compress_array(arr, quality=quality)
-    coeffs = comp.coeffs
-    bitstream, dc_table, ac_tables, layout = _encode_blocks_huffman(coeffs)
+    arr = _load_image(input_path)
+    comp = compress_array(arr, quality=quality, sampling=sampling)
 
-    h, w = comp.orig_shape
-    h_p, w_p = comp.padded_shape
-    by = h_p // BLOCK_SIZE
-    bx = w_p // BLOCK_SIZE
+    classes = (
+        COMPONENT_CLASSES if comp.n_components == 3 else (CLASS_LUMA,)
+    )
+    bitstream, table_sets = _encode_planes(comp.planes, classes)
+
+    h, w = comp.orig_shape[0], comp.orig_shape[1]
 
     header = bytearray()
     header.extend(MAGIC)
     header.extend(int(h).to_bytes(4, "big"))
     header.extend(int(w).to_bytes(4, "big"))
     header.append(int(comp.quality) & 0xFF)
-    header.extend(int(by).to_bytes(2, "big"))
-    header.extend(int(bx).to_bytes(2, "big"))
+    header.append(((comp.n_components & 0x0F) << 4) | (comp.sampling & 0x0F))
 
-    # Tables are self-delimiting -- each opens with its own symbol count -- so
-    # no byte-length prefix is stored.
-    header.extend(_serialize_huffman_table(dc_table))
-
-    # Only contexts that actually occur are written, identified by a bitmap.
-    # Serialising every context unconditionally would spend 2 bytes apiece on
-    # empty tables, which is pure overhead on an image that uses few bands --
-    # the regime phase 4.1 was written to protect.
-    header.append(layout & 0xFF)
-    present = 0
-    for ctx, table in enumerate(ac_tables):
-        if table:
-            present |= 1 << ctx
-    header.extend(present.to_bytes(2, "big"))
-    for table in ac_tables:
-        if table:
-            header.extend(_serialize_huffman_table(table))
+    for tables in table_sets:
+        _write_class_tables(header, tables)
 
     header.extend(len(bitstream).to_bytes(4, "big"))
 
@@ -1564,7 +2059,7 @@ def decompress_huffman_file(input_path: str, output_path: str) -> None:
     """Inverse of :func:`compress_huffman_file`.
 
     Reads the custom container, decodes Huffman-coded coefficients, performs
-    inverse DCT + dequantization, and writes a grayscale image.
+    inverse DCT + dequantization, and writes a grayscale or RGB image.
     """
 
     with open(input_path, "rb") as f:
@@ -1576,40 +2071,43 @@ def decompress_huffman_file(input_path: str, output_path: str) -> None:
         h = int.from_bytes(_read_exactly(f, 4), "big")
         w = int.from_bytes(_read_exactly(f, 4), "big")
         quality = _read_exactly(f, 1)[0]
-        by = int.from_bytes(_read_exactly(f, 2), "big")
-        bx = int.from_bytes(_read_exactly(f, 2), "big")
 
-        dc_table = _read_huffman_table(f)
-
-        layout = _read_exactly(f, 1)[0]
-        if layout >= len(AC_LAYOUTS):
+        fmt = _read_exactly(f, 1)[0]
+        n_components = fmt >> 4
+        sampling = fmt & 0x0F
+        if n_components not in (1, 3):
             raise ValueError(
-                f"Container declares AC band layout {layout}, but this build "
-                f"defines only {len(AC_LAYOUTS)}. The layout table is part of "
-                "the format; a file written against a different "
-                "AC_LAYOUT_EDGES cannot be decoded."
+                f"Container declares {n_components} components; only 1 "
+                "(grayscale) and 3 (YCbCr) are defined"
+            )
+        if sampling not in SAMPLING_FACTORS:
+            raise ValueError(
+                f"Container declares chroma sampling {sampling}, which is not "
+                f"one of {sorted(SAMPLING_FACTORS)}"
             )
 
-        present = int.from_bytes(_read_exactly(f, 2), "big")
-        ac_tables = [
-            _read_huffman_table(f) if present & (1 << ctx) else {}
-            for ctx in range(AC_LAYOUT_SIZES[layout])
-        ]
+        n_classes = 1 if n_components == 1 else 2
+        table_sets = [_read_class_tables(f) for _ in range(n_classes)]
 
         bit_len = int.from_bytes(_read_exactly(f, 4), "big")
         bitstream = _read_exactly(f, bit_len)
 
-    coeffs = _decode_blocks_huffman(by, bx, bitstream, dc_table, ac_tables, layout)
+    padded_shapes = _padded_shapes_for(h, w, sampling, n_components)
+    classes = COMPONENT_CLASSES if n_components == 3 else (CLASS_LUMA,)
+    planes = _decode_planes(
+        _block_shapes(padded_shapes), classes, bitstream, table_sets
+    )
 
     comp = CompressedImage(
-        coeffs=coeffs,
-        orig_shape=(h, w),
-        padded_shape=(by * BLOCK_SIZE, bx * BLOCK_SIZE),
+        planes=planes,
+        orig_shape=(h, w, 3) if n_components == 3 else (h, w),
+        padded_shapes=padded_shapes,
         quality=int(quality),
+        sampling=sampling,
     )
 
     img_arr = decompress_to_array(comp)
-    im = Image.fromarray(img_arr, mode="L")
+    im = Image.fromarray(img_arr, mode="RGB" if n_components == 3 else "L")
     im.save(output_path)
 
 

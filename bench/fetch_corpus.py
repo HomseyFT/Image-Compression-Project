@@ -1,4 +1,4 @@
-"""Download the Kodak test corpus into ``tests/images/``.
+"""Download the Kodak test corpus into ``images/``.
 
 ``python -m bench.fetch_corpus``
 
@@ -6,10 +6,9 @@ Tuning against a single image risks overfitting -- the concern already raised
 against quantization-table tuning in SPEC.md 4.3. The Kodak set (24 uncompressed
 photographs) is the conventional choice for image-codec R-D evaluation.
 
-The images are **not** committed: ``tests/images/`` is gitignored. Both
-``tests/conftest.py::real_images`` and ``python -m bench`` pick up whatever is
-present, so the corpus is optional and the suite degrades to ``dog.png`` alone
-without it.
+Both ``tests/conftest.py::real_images`` and ``python -m bench`` read whatever
+is present in ``images/``. Existing files are left alone, so this is safe to
+re-run alongside a corpus that is already partly populated.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import urllib.request
 
 BASE_URL = "https://r0k.us/graphics/kodak/kodak/kodim{:02d}.png"
 COUNT = 24
-DEST = pathlib.Path(__file__).resolve().parent.parent / "tests" / "images"
+DEST = pathlib.Path(__file__).resolve().parent.parent / "images"
 
 
 def fetch(dest: pathlib.Path = DEST, count: int = COUNT) -> int:

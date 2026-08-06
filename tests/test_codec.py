@@ -154,18 +154,22 @@ def test_truncated_file_raises(tmp_path, sample_icj, keep):
         c.decompress_huffman_file(str(trunc), str(tmp_path / "o.png"))
 
 
-def test_corrupt_code_length_raises(tmp_path, sample_icj):
-    """An out-of-range code length in the table must be rejected.
+# ICJ4 header: magic 0-3, height 4-7, width 8-11, quality 12, format 13.
+# The DC table follows immediately -- a 2-byte symbol count, then that many
+# (symbol, length) pairs. Derived rather than hardcoded so a container change
+# moves these tests instead of silently pointing them at the wrong byte.
+DC_TABLE_OFFSET = 14
+DC_FIRST_LENGTH = DC_TABLE_OFFSET + 3   # count(2) + first symbol(1)
 
-    Header layout: magic 0-3, height 4-7, width 8-11, quality 12,
-    blocks_y 13-14, blocks_x 15-16, dc_len 17-18, then the DC table --
-    2-byte symbol count at 19-20, then (symbol, length) pairs. Byte 22 is
-    therefore the first code length.
-    """
+
+def test_corrupt_code_length_raises(tmp_path, sample_icj):
+    """An out-of-range code length in the table must be rejected."""
 
     data = bytearray(sample_icj.read_bytes())
-    assert 1 <= data[22] <= c.MAX_CODE_LENGTH, "offset 22 is not a code length"
-    data[22] = 0xFF
+    assert 1 <= data[DC_FIRST_LENGTH] <= c.MAX_CODE_LENGTH, (
+        f"offset {DC_FIRST_LENGTH} is not a code length -- header layout moved"
+    )
+    data[DC_FIRST_LENGTH] = 0xFF
     bad = tmp_path / "c.icj"
     bad.write_bytes(data)
 
@@ -174,10 +178,10 @@ def test_corrupt_code_length_raises(tmp_path, sample_icj):
 
 
 def test_corrupt_table_length_field_raises(tmp_path, sample_icj):
-    """A bogus table byte-length must be caught as truncation."""
+    """A bogus table symbol count must be caught as truncation."""
 
     data = bytearray(sample_icj.read_bytes())
-    data[17] = 0xFF  # dc_len high byte -> table claims to be huge
+    data[DC_TABLE_OFFSET] = 0xFF  # count high byte -> table claims to be huge
     bad = tmp_path / "c2.icj"
     bad.write_bytes(data)
 

@@ -40,7 +40,13 @@ from PIL import Image
 import compression
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-IMAGE_DIR = pathlib.Path(__file__).resolve().parent / "images"
+IMAGE_DIR = REPO_ROOT / "images"
+DOG = IMAGE_DIR / "dog.png"
+
+# Downscale for the fixtures. The corpus is 11 photographs and trellis encode
+# is ~0.4 s per megapixel, so scoring them at native resolution would take the
+# suite from seconds to minutes.
+FIXTURE_MAX_SIDE = 384
 
 
 def _flat(h: int, w: int) -> np.ndarray:
@@ -86,30 +92,59 @@ def corpus() -> dict[str, np.ndarray]:
 
 @pytest.fixture(scope="session")
 def photo() -> np.ndarray:
-    """The real-photo sample, downscaled to keep the suite fast."""
+    """The reference photo sample, downscaled to keep the suite fast.
 
-    path = REPO_ROOT / "dog.png"
-    if not path.exists():
-        pytest.skip("dog.png not available")
-    full = Image.fromarray(compression._load_grayscale(str(path)), mode="L")
+    Missing this **fails**, it does not skip. Golden pins and every BD-rate
+    gate hang off this fixture, so a silent skip would take 53 tests out of
+    the suite while it still reported all-green -- which is precisely what
+    happened when ``dog.png`` was moved into ``images/``. A corpus that has
+    gone missing is a broken checkout, not a reason to test less.
+    """
+
+    if not DOG.exists():
+        raise FileNotFoundError(
+            f"{DOG} is missing -- golden pins and BD-rate gates cannot run "
+            "without it. Restore it, or run `python -m bench.fetch_corpus` "
+            "for the Kodak set."
+        )
+    full = Image.fromarray(compression._load_grayscale(str(DOG)), mode="L")
     return np.array(full.resize((256, 256), Image.LANCZOS), dtype=np.uint8)
 
 
 @pytest.fixture(scope="session")
-def real_images(photo: np.ndarray) -> dict[str, np.ndarray]:
+def real_images() -> dict[str, np.ndarray]:
     """Real photographs, for rate-distortion gating.
 
-    Always contains ``dog``. Any additional images dropped into
-    ``tests/images/`` are picked up automatically -- the Kodak set is the
-    conventional choice. Tuning quantization or trellis parameters against a
-    single image risks overfitting, so prefer this fixture over ``corpus``
-    when measuring compression gains.
+    Every image in ``images/`` is picked up automatically -- the Kodak set is
+    the conventional choice. Tuning quantization, trellis or entropy
+    parameters against a single image risks overfitting, so prefer this
+    fixture over ``corpus`` when measuring compression gains.
+
+    Images are downscaled to :data:`FIXTURE_MAX_SIDE`; see the note there.
     """
 
-    images = {"dog": photo}
-    if IMAGE_DIR.is_dir():
-        for path in sorted(IMAGE_DIR.iterdir()):
-            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
-                with Image.open(path) as im:
-                    images[path.stem] = np.array(im.convert("L"), dtype=np.uint8)
+    if not IMAGE_DIR.is_dir():
+        raise FileNotFoundError(
+            f"{IMAGE_DIR} is missing. Run `python -m bench.fetch_corpus`."
+        )
+
+    suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    images: dict[str, np.ndarray] = {}
+    for path in sorted(IMAGE_DIR.iterdir()):
+        if path.suffix.lower() not in suffixes:
+            continue
+        arr = compression._load_grayscale(str(path))
+        h, w = arr.shape
+        if max(h, w) > FIXTURE_MAX_SIDE:
+            scale = FIXTURE_MAX_SIDE / max(h, w)
+            arr = np.array(
+                Image.fromarray(arr, mode="L").resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS
+                ),
+                dtype=np.uint8,
+            )
+        images[path.stem] = arr
+
+    if not images:
+        raise FileNotFoundError(f"No images found in {IMAGE_DIR}.")
     return images

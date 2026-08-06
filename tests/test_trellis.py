@@ -156,6 +156,41 @@ def test_trellis_holds_up_across_content(photo):
             )
 
 
+def test_trellis_iterations_is_a_knob_with_a_real_cost(photo):
+    """More passes must not make things worse, and zero must be a no-op.
+
+    The rate gain per pass is small (0.163 pp of BD-rate for pass 2, measured
+    across the 11-image corpus) but consistent, so this checks the direction
+    rather than a magnitude that would be noise at fixture scale.
+    """
+
+    plain = c.compress_array(photo, quality=50, trellis=False)
+    none = c.compress_array(photo, quality=50, trellis_iterations=0)
+    assert np.array_equal(none.coeffs, plain.coeffs), (
+        "zero iterations must reproduce plain quantization exactly"
+    )
+
+    one = c.compress_array(photo, quality=50, trellis_iterations=1)
+    two = c.compress_array(photo, quality=50, trellis_iterations=2)
+    assert _rate(one.coeffs) < _rate(plain.coeffs)
+    assert _rate(two.coeffs) <= _rate(one.coeffs)
+
+
+def test_trellis_iterations_default_matches_the_constant(photo):
+    """The explicit default must be the same as passing nothing."""
+
+    implicit = c.compress_array(photo, quality=50)
+    explicit = c.compress_array(
+        photo, quality=50, trellis_iterations=c.TRELLIS_ITERATIONS
+    )
+    assert np.array_equal(implicit.coeffs, explicit.coeffs)
+
+
+def test_trellis_iterations_rejects_negative(photo):
+    with pytest.raises(ValueError, match="must be >= 0"):
+        c.compress_array(photo, quality=50, trellis_iterations=-1)
+
+
 def test_rd_scoring_requires_a_monotone_curve():
     """Degenerate content cannot be used to score rate-distortion changes.
 

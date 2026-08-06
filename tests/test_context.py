@@ -273,10 +273,11 @@ def test_container_rejects_an_unknown_band_layout(tmp_path, photo):
     Image.fromarray(photo[:32, :32], mode="L").save(src)
     c.compress_huffman_file(str(src), str(dst), quality=50)
 
-    # The layout byte follows the DC table, whose length is self-describing.
+    # The layout byte follows the DC table, which is self-delimiting: a
+    # 2-byte symbol count at offset 14, then that many (symbol, length) pairs.
     raw = bytearray(dst.read_bytes())
-    dc_count = int.from_bytes(raw[17:19], "big")
-    layout_offset = 19 + 2 * dc_count
+    dc_count = int.from_bytes(raw[14:16], "big")
+    layout_offset = 16 + 2 * dc_count
     assert raw[layout_offset] < len(c.AC_LAYOUTS)
     raw[layout_offset] = len(c.AC_LAYOUTS)
     dst.write_bytes(raw)
@@ -285,20 +286,23 @@ def test_container_rejects_an_unknown_band_layout(tmp_path, photo):
         c.decompress_huffman_file(str(dst), str(tmp_path / "out.png"))
 
 
-def test_icj3_magic_rejects_icj2(tmp_path, photo):
+def test_current_magic_rejects_older_containers(tmp_path, photo):
+    """Each format bump is breaking; older files must be refused, not guessed at."""
+
     from PIL import Image
 
     src, dst = tmp_path / "in.png", tmp_path / "out.icj"
     Image.fromarray(photo[:32, :32], mode="L").save(src)
     c.compress_huffman_file(str(src), str(dst), quality=50)
 
-    raw = bytearray(dst.read_bytes())
-    assert raw[:4] == b"ICJ3"
-    raw[:4] = b"ICJ2"
-    dst.write_bytes(raw)
-
-    with pytest.raises(ValueError, match="bad magic"):
-        c.decompress_huffman_file(str(dst), str(tmp_path / "out.png"))
+    assert dst.read_bytes()[:4] == b"ICJ4"
+    for old in (b"ICJ1", b"ICJ2", b"ICJ3"):
+        raw = bytearray(dst.read_bytes())
+        raw[:4] = old
+        stale = tmp_path / f"{old.decode()}.icj"
+        stale.write_bytes(raw)
+        with pytest.raises(ValueError, match="bad magic"):
+            c.decompress_huffman_file(str(stale), str(tmp_path / "out.png"))
 
 
 # --- The gain ----------------------------------------------------------------
@@ -318,9 +322,10 @@ def test_the_chosen_layout_is_never_worse_than_a_single_table(photo, quality):
     comp = c.compress_array(photo, quality=quality)
     stream = c._scan_symbols(comp.coeffs)
 
-    single_cost, _ = c._ac_layout_cost(stream, 0)
-    layout, _tables = c._choose_ac_layout(stream)
-    chosen_cost, _ = c._ac_layout_cost(stream, layout)
+    args = (stream.ac_symbols, stream.ac_positions)
+    single_cost, _ = c._ac_layout_cost(*args, 0)
+    layout, _tables = c._choose_ac_layout(*args)
+    chosen_cost, _ = c._ac_layout_cost(*args, layout)
 
     assert chosen_cost <= single_cost, (
         f"q{quality}: chose layout {layout} costing {chosen_cost:.0f} B over "
@@ -339,9 +344,10 @@ def test_context_tables_pay_for_themselves_on_a_photograph(photo, quality):
     comp = c.compress_array(photo, quality=quality)
     stream = c._scan_symbols(comp.coeffs)
 
-    single_cost, _ = c._ac_layout_cost(stream, 0)
-    layout, _ = c._choose_ac_layout(stream)
-    chosen_cost, _ = c._ac_layout_cost(stream, layout)
+    args = (stream.ac_symbols, stream.ac_positions)
+    single_cost, _ = c._ac_layout_cost(*args, 0)
+    layout, _ = c._choose_ac_layout(*args)
+    chosen_cost, _ = c._ac_layout_cost(*args, layout)
 
     gain = 1.0 - chosen_cost / single_cost
     assert gain > 0.02, f"context modeling gained only {gain:.1%} at q{quality}"
@@ -358,8 +364,8 @@ def test_finer_layouts_win_on_larger_images(photo):
     small = c._scan_symbols(c.compress_array(photo[:64, :64], quality=50).coeffs)
     large = c._scan_symbols(c.compress_array(np.tile(photo, (3, 3)), quality=50).coeffs)
 
-    small_layout, _ = c._choose_ac_layout(small)
-    large_layout, _ = c._choose_ac_layout(large)
+    small_layout, _ = c._choose_ac_layout(small.ac_symbols, small.ac_positions)
+    large_layout, _ = c._choose_ac_layout(large.ac_symbols, large.ac_positions)
     assert large_layout >= small_layout, (
         f"more symbols chose a coarser layout ({large_layout} < {small_layout})"
     )

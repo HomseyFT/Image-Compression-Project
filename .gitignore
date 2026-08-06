@@ -6,5 +6,7 @@ reconstructed*.png
 *.egg-info/
 SPEC.md
 
-# Benchmark corpus, fetched by `python -m bench.fetch_corpus`, never committed.
-tests/images/
+# The `images/` corpus is tracked deliberately: golden pins and the BD-rate
+# gates are meaningless without it, and a missing corpus now fails the suite
+# rather than silently skipping 53 tests. `python -m bench.fetch_corpus` tops
+# it up to the full Kodak set.
