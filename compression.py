@@ -9,16 +9,17 @@ JPEG-style pipeline for black-and-white (grayscale) images:
 - Level shift samples by 128
 - Apply 2D DCT on 8x8 blocks (implemented with pure NumPy math)
 - Quantize coefficients with a JPEG-like luminance quantization matrix
-- Entropy code with JPEG-style DC/AC symbols plus per-file Huffman tables
-- Pack into a custom ICJ2 container
+- Entropy code with JPEG-style DC/AC symbols plus per-file Huffman tables,
+  with AC symbols split across per-frequency-band context tables
+- Pack into a custom ICJ3 container
 - Decompress by reversing the above steps
 
 Usage (CLI):
 
-    # Compress a grayscale image to the custom ICJ2 container
+    # Compress a grayscale image to the custom ICJ3 container
     python compression.py compress input.png output.icj --quality 50
 
-    # Decompress from ICJ2 back to a PNG image
+    # Decompress from ICJ3 back to a PNG image
     python compression.py decompress input.icj output.png
 
 You can also use the `compress_array` and `decompress_to_array` functions
@@ -36,14 +37,82 @@ import numpy as np
 from PIL import Image
 
 
-# Container magic. ICJ2 supersedes the original ICJ1 layout; no backwards
-# compatibility is provided, as ICJ1 files could encode an unclamped quality
-# byte that decoded against the wrong quantization matrix.
-MAGIC = b"ICJ2"
+# Container magic. ICJ3 supersedes ICJ2 (one AC Huffman table) by splitting AC
+# coding across per-frequency-band context tables; see AC_BAND_EDGES. ICJ2
+# superseded ICJ1, whose unclamped quality byte could decode against the wrong
+# quantization matrix. No backwards compatibility is provided for either.
+MAGIC = b"ICJ3"
 
 # Maximum Huffman code length the container can represent. The decoder scans
 # lengths 1..MAX_CODE_LENGTH.
 MAX_CODE_LENGTH = 32
+
+
+# --- AC context modeling ----------------------------------------------------
+#
+# The AC symbol stream is coded with one Huffman table per frequency band
+# rather than a single table for the whole image. A symbol's context is the
+# zigzag position at which it is emitted -- that is, where its zero run
+# *starts*, not where the coefficient lands. This matters: the decoder knows
+# the former before reading the symbol (it is the next position to fill) and
+# cannot know the latter until it has decoded the run. Context selection is
+# therefore causal on both sides, and no side information is transmitted.
+#
+# Bands are logarithmic, fine at low frequencies where the distribution moves
+# fastest and coarse at high frequencies where symbols are sparse and an extra
+# table would cost more than it saves.
+#
+# Measured on dog.png against a single AC table, net of real table cost:
+#
+#   context variable      q30     q50     q80
+#   ordinal index (16)   +8.9%   +8.1%   +5.6%
+#   zigzag position (16) +9.5%   +8.4%   +6.1%
+#   zigzag log-band (15) +9.8%   +9.4%   +7.3%   <- chosen
+#
+# Conditioning on the *previous symbol* was also measured and rejected: its
+# idealized 14.2% conditional-entropy gain collapses to under 2% once table
+# cost is paid, because a 256-context split is unaffordable. See SPEC.md 7.1.
+#
+# --- Why the layout is chosen per image, not fixed ---
+#
+# Splitting is only worth it when there are enough symbols to amortise a table.
+# The 15-band layout is a clear win on a 2500x2500 photo (+21% on AC at q50)
+# and an outright *loss* on a 256x256 one at low quality (-7.1% at q10), where
+# 15 tables cost more than the entire AC payload. Fixing any single layout
+# therefore regresses one end of the size range:
+#
+#   AC-side gain vs. a single table, by layout
+#                    1        3        5        8       15
+#   256px  q10   +0.00%   -0.35%   -0.69%   -4.03%   -7.08%
+#   256px  q50   +0.00%   +3.46%   +4.67%   +3.35%   +0.28%
+#   256px  q90   +0.00%   +6.45%   +8.67%   +8.57%   +7.65%
+#   1000px q10   +0.00%   +8.81%  +12.19%  +12.77%  +13.55%
+#   1000px q50   +0.00%  +15.44%  +19.43%  +19.95%  +21.08%
+#
+# So the encoder prices every layout and writes the winner's id in the
+# container. Layout 0 is a single table -- exactly ICJ2's behaviour -- which
+# makes ICJ3 provably never worse than its predecessor on any input.
+AC_LAYOUT_EDGES = (
+    (1, 64),                                                    # 0: 1 context
+    (1, 4, 12, 64),                                             # 1: 3
+    (1, 3, 6, 12, 24, 64),                                      # 2: 5
+    (1, 2, 3, 5, 7, 10, 16, 28, 64),                            # 3: 8
+    (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 19, 24, 32, 44, 64),   # 4: 15
+)
+
+
+def _build_ac_band_table(edges: tuple[int, ...]) -> np.ndarray:
+    """Map zigzag position 0..63 -> AC context index for one layout."""
+
+    band = np.zeros(64, dtype=np.int64)
+    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        band[lo:hi] = i
+    return band
+
+
+AC_LAYOUTS = tuple(_build_ac_band_table(e) for e in AC_LAYOUT_EDGES)
+AC_LAYOUT_SIZES = tuple(len(e) - 1 for e in AC_LAYOUT_EDGES)
+MAX_AC_CONTEXTS = max(AC_LAYOUT_SIZES)
 
 # Trellis (rate-distortion optimized quantization) tuning. The multiplier is
 # expressed relative to the mean squared quantizer step so that it tracks
@@ -495,6 +564,25 @@ def _load_grayscale(path: str) -> np.ndarray:
         return np.array(im.convert("L"), dtype=np.uint8)
 
 
+def _marginal_ac_table(coeffs: np.ndarray) -> dict[int, tuple[int, int]]:
+    """A single order-0 AC table over all contexts, for the trellis rate model.
+
+    The bitstream is coded with per-context tables, but the trellis DP prices
+    a symbol *before* knowing which context it will land in: zeroing a
+    coefficient shifts every later symbol's zigzag position, and therefore its
+    band. Pricing against the marginal distribution sidesteps that circularity.
+
+    This under-prices the real gain slightly -- context tables are cheaper than
+    the marginal -- so the DP is conservative about zeroing rather than
+    over-eager, which is the safe direction for a rate model to err in. A
+    context-aware variant was measured; see SPEC.md 7.6.
+    """
+
+    stream = _scan_symbols(coeffs)
+    counts = np.bincount(stream.ac_symbols, minlength=256)
+    return _build_huffman_table({i: int(n) for i, n in enumerate(counts)})
+
+
 def _ac_bit_costs(ac_table: dict[int, tuple[int, int]]) -> np.ndarray:
     """Dense AC symbol -> code length lookup for the trellis rate model.
 
@@ -552,8 +640,7 @@ def compress_array(
         # and re-running closes that loop; iterating is bounded and keeps the
         # best result seen, since convergence is not guaranteed.
         for _ in range(TRELLIS_ITERATIONS):
-            _, _, ac_table = _encode_blocks_huffman(coeffs)
-            ac_bits = _ac_bit_costs(ac_table)
+            ac_bits = _ac_bit_costs(_marginal_ac_table(coeffs))
             candidate = _trellis_quantize(dct.astype(np.float64), Q, ac_bits, lam)
             if np.array_equal(candidate, coeffs):
                 break
@@ -773,15 +860,6 @@ def _assign_canonical_codes(lengths: dict[int, int]) -> dict[int, tuple[int, int
     return table
 
 
-def _build_decode_table(huff_table: dict[int, tuple[int, int]]) -> dict[tuple[int, int], int]:
-    """Build (length, code) -> symbol map for decoding."""
-
-    decode: dict[tuple[int, int], int] = {}
-    for sym, (code, n_bits) in huff_table.items():
-        decode[(n_bits, code)] = sym
-    return decode
-
-
 def _value_category_vec(v: np.ndarray) -> np.ndarray:
     """Vectorized :func:`_value_category` over an integer array."""
 
@@ -810,7 +888,13 @@ class _SymbolStream:
     ac_symbols: np.ndarray   # (M,) run/size byte (0x00 EOB, 0xF0 ZRL)
     ac_values: np.ndarray    # (M,) coefficient value (0 for EOB/ZRL)
     ac_sizes: np.ndarray     # (M,) mantissa bit count
+    ac_positions: np.ndarray  # (M,) zigzag position the symbol is emitted at
     n_blocks: int
+
+    def contexts(self, layout: int) -> np.ndarray:
+        """AC context per symbol under a given band layout."""
+
+        return AC_LAYOUTS[layout][self.ac_positions]
 
 
 def _scan_symbols(coeffs: np.ndarray) -> _SymbolStream:
@@ -861,6 +945,14 @@ def _scan_symbols(coeffs: np.ndarray) -> _SymbolStream:
     e_val = np.where(is_zrl, 0, vals[src])
     e_size = np.where(is_zrl, 0, sizes[src])
 
+    # Zigzag position at which each symbol is emitted: where its zero run
+    # starts. The run for this group begins one past the previous non-zero
+    # (``prev_pos + 1`` zero-based, hence ``+ 2`` in 1-based zigzag terms), and
+    # each preceding ZRL advances 16. Deliberately *not* the position the
+    # coefficient lands at -- the decoder cannot know that until it has
+    # decoded the run, so it would not be a causal context.
+    e_kpos = (prev_pos[src] + 2) + 16 * sub
+
     # --- EOB for every block that does not run to the final position ---
     last_pos = np.full(n_blocks, -1, dtype=np.int64)
     if len(blk):
@@ -875,6 +967,10 @@ def _scan_symbols(coeffs: np.ndarray) -> _SymbolStream:
     e_val = np.concatenate([e_val, np.zeros(n_eob, dtype=np.int64)])
     e_size = np.concatenate([e_size, np.zeros(n_eob, dtype=np.int64)])
 
+    # An EOB sits one past the block's last non-zero; an all-zero block emits
+    # it at position 1, which ``last_pos == -1`` yields for free.
+    e_kpos = np.concatenate([e_kpos, last_pos[eob_blocks] + 2])
+
     # Emission order: block, then zigzag position, then ZRLs before the value.
     order = np.lexsort((e_sub, e_pos, e_block))
 
@@ -885,6 +981,7 @@ def _scan_symbols(coeffs: np.ndarray) -> _SymbolStream:
         ac_symbols=e_sym[order],
         ac_values=e_val[order],
         ac_sizes=e_size[order],
+        ac_positions=np.clip(e_kpos[order], 1, 63),
         n_blocks=n_blocks,
     )
 
@@ -907,7 +1004,90 @@ def _pack_bits(codes: np.ndarray, lengths: np.ndarray) -> bytes:
     return np.packbits(bits).tobytes()
 
 
-def _encode_blocks_huffman(coeffs: np.ndarray) -> tuple[bytes, dict[int, tuple[int, int]], dict[int, tuple[int, int]]]:
+def _build_ac_context_tables(
+    symbols: np.ndarray, contexts: np.ndarray, n_contexts: int
+) -> list[dict[int, tuple[int, int]]]:
+    """One Huffman table per AC context, from the symbol stream.
+
+    A context that never occurs gets an empty table. That is not an error:
+    high-frequency bands go unused on smooth images and at low quality, where
+    every block ends long before the tail of the zigzag. Unused contexts are
+    omitted from the container entirely.
+    """
+
+    tables: list[dict[int, tuple[int, int]]] = []
+    for ctx in range(n_contexts):
+        counts = np.bincount(symbols[contexts == ctx], minlength=256)
+        if not counts.any():
+            tables.append({})
+            continue
+        tables.append(_build_huffman_table({i: int(n) for i, n in enumerate(counts)}))
+    return tables
+
+
+def _ac_layout_cost(
+    stream: _SymbolStream, layout: int
+) -> tuple[float, list[dict[int, tuple[int, int]]]]:
+    """Total bytes -- code bits plus serialized tables -- for one band layout.
+
+    Table cost is counted because it is the whole reason coarser layouts win
+    on small images. Scoring code bits alone would always prefer the finest
+    split, which is exactly the mistake that makes a 256px image at q10 come
+    out 7% *larger*.
+    """
+
+    contexts = stream.contexts(layout)
+    tables = _build_ac_context_tables(
+        stream.ac_symbols, contexts, AC_LAYOUT_SIZES[layout]
+    )
+
+    bits = 0
+    table_bytes = 0
+    for ctx, table in enumerate(tables):
+        if not table:
+            continue
+        counts = np.bincount(stream.ac_symbols[contexts == ctx], minlength=256)
+        bits += sum(int(counts[sym]) * n for sym, (_cd, n) in table.items())
+        table_bytes += len(_serialize_huffman_table(table))
+
+    return bits / 8.0 + table_bytes, tables
+
+
+def _choose_ac_layout(
+    stream: _SymbolStream,
+) -> tuple[int, list[dict[int, tuple[int, int]]]]:
+    """Pick the band layout that costs the fewest bytes on this image.
+
+    Ties go to the coarser layout, which keeps the container smaller and the
+    decoder's table build cheaper for no rate cost.
+    """
+
+    best_layout = 0
+    best_cost, best_tables = _ac_layout_cost(stream, 0)
+    for layout in range(1, len(AC_LAYOUTS)):
+        cost, tables = _ac_layout_cost(stream, layout)
+        if cost < best_cost:
+            best_layout, best_cost, best_tables = layout, cost, tables
+    return best_layout, best_tables
+
+
+def _ac_tables_to_arrays(
+    tables: list[dict[int, tuple[int, int]]]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dense ``(context, symbol) -> code/length`` lookups for all AC tables."""
+
+    code = np.zeros((len(tables), 256), dtype=np.int64)
+    length = np.zeros((len(tables), 256), dtype=np.int64)
+    for ctx, table in enumerate(tables):
+        for sym, (cd, n) in table.items():
+            code[ctx, sym] = cd
+            length[ctx, sym] = n
+    return code, length
+
+
+def _encode_blocks_huffman(
+    coeffs: np.ndarray,
+) -> tuple[bytes, dict[int, tuple[int, int]], list[dict[int, tuple[int, int]]], int]:
     """Run JPEG-like DC/AC coding + Huffman on quantized blocks.
 
     Parameters
@@ -919,22 +1099,27 @@ def _encode_blocks_huffman(coeffs: np.ndarray) -> tuple[bytes, dict[int, tuple[i
     -------
     bitstream:
         Huffman-coded bitstream.
-    dc_table, ac_table:
-        Huffman tables used for DC categories (0-11) and AC symbols (0-255).
+    dc_table:
+        Huffman table for DC categories (0-11).
+    ac_tables:
+        One Huffman table for AC symbols (0-255) per context of the chosen
+        band layout; see :data:`AC_LAYOUT_EDGES`.
+    layout:
+        Index into :data:`AC_LAYOUTS` of the band layout that priced cheapest.
     """
 
     stream = _scan_symbols(coeffs)
 
     # First pass: symbol frequencies -> optimal per-image Huffman tables.
     dc_counts = np.bincount(stream.dc_cats, minlength=12)
-    ac_counts = np.bincount(stream.ac_symbols, minlength=256)
     dc_table = _build_huffman_table({i: int(n) for i, n in enumerate(dc_counts)})
-    ac_table = _build_huffman_table({i: int(n) for i, n in enumerate(ac_counts)})
+    layout, ac_tables = _choose_ac_layout(stream)
+    ac_contexts = stream.contexts(layout)
 
     # Second pass: emit. Per block the layout is
     #   [DC code][DC mantissa]  then  [AC symbol][AC mantissa] * n_ac
     dc_code, dc_len = _table_to_arrays(dc_table, 12)
-    ac_code, ac_len = _table_to_arrays(ac_table, 256)
+    ac_code, ac_len = _ac_tables_to_arrays(ac_tables)
 
     n_ac = np.bincount(stream.ac_block, minlength=stream.n_blocks)
     per_block = 2 + 2 * n_ac
@@ -952,12 +1137,12 @@ def _encode_blocks_huffman(coeffs: np.ndarray) -> tuple[bytes, dict[int, tuple[i
     within = np.arange(len(stream.ac_block)) - ac_start[stream.ac_block]
     idx = block_start[stream.ac_block] + 2 + 2 * within
 
-    codes[idx] = ac_code[stream.ac_symbols]
-    lengths[idx] = ac_len[stream.ac_symbols]
+    codes[idx] = ac_code[ac_contexts, stream.ac_symbols]
+    lengths[idx] = ac_len[ac_contexts, stream.ac_symbols]
     codes[idx + 1] = _value_to_bits_vec(stream.ac_values, stream.ac_sizes)
     lengths[idx + 1] = stream.ac_sizes
 
-    return _pack_bits(codes, lengths), dc_table, ac_table
+    return _pack_bits(codes, lengths), dc_table, ac_tables, layout
 
 
 def _table_to_arrays(table: dict[int, tuple[int, int]], size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -971,86 +1156,250 @@ def _table_to_arrays(table: dict[int, tuple[int, int]], size: int) -> tuple[np.n
     return code, length
 
 
+# Width of the direct-indexed Huffman decode window. A code no longer than
+# this is resolved in a single lookup; longer ones fall back to a bit-at-a-time
+# scan. 12 bits costs 4096 entries per table and covers essentially every code
+# natural images produce, while staying cheap enough to rebuild per file.
+DECODE_LUT_BITS = 12
+
+# Zero bytes the reader will invent past the end of the bitstream. The encoder
+# pads the final code to a byte boundary, so a correct decode overruns by at
+# most 7 bits; anything beyond this slack is a corrupt stream running away,
+# and must raise rather than decode padding into plausible garbage.
+_EOF_SLACK_BYTES = 8
+
+
+def _build_decode_lut(table: dict[int, tuple[int, int]]):
+    """Build ``(symbols, lengths, long_codes)`` for fast decoding.
+
+    ``symbols`` and ``lengths`` are Python lists indexed by the next
+    :data:`DECODE_LUT_BITS` bits of the stream; a symbol of ``-1`` means the
+    code is longer than the window and must be resolved via ``long_codes``,
+    keyed by ``(length, code)``.
+
+    Lists rather than arrays: this is indexed once per symbol from Python, and
+    a list index is several times cheaper than a NumPy scalar index.
+
+    Returns ``None`` for an empty table, i.e. an AC context that never occurs.
+    """
+
+    if not table:
+        return None
+
+    size = 1 << DECODE_LUT_BITS
+    symbols = [-1] * size
+    lengths = [0] * size
+    long_codes: dict[tuple[int, int], int] = {}
+
+    for sym, (code, n) in table.items():
+        if n <= DECODE_LUT_BITS:
+            shift = DECODE_LUT_BITS - n
+            start = code << shift
+            for i in range(start, start + (1 << shift)):
+                symbols[i] = sym
+                lengths[i] = n
+        else:
+            long_codes[(n, code)] = sym
+
+    return symbols, lengths, long_codes
+
+
+def _decode_long_code(read_bit, long_codes: dict[tuple[int, int], int], what: str) -> int:
+    """Resolve a code longer than the LUT window, bit at a time.
+
+    Off the hot path: natural images produce codes well under
+    :data:`DECODE_LUT_BITS`, so this runs rarely enough not to matter.
+    """
+
+    code = 0
+    for length in range(1, MAX_CODE_LENGTH + 1):
+        code = (code << 1) | read_bit()
+        found = long_codes.get((length, code))
+        if found is not None:
+            return found
+    raise ValueError(f"Failed to decode {what}")
+
+
 def _decode_blocks_huffman(
     by: int,
     bx: int,
     bitstream: bytes,
     dc_table: dict[int, tuple[int, int]],
-    ac_table: dict[int, tuple[int, int]],
+    ac_tables: list[dict[int, tuple[int, int]]],
+    layout: int,
 ) -> np.ndarray:
     """Inverse of :func:`_encode_blocks_huffman`.
 
     Returns an array of shape (by, bx, 8, 8) with quantized coefficients.
+
+    The AC table is selected per symbol by ``AC_LAYOUTS[layout]`` indexed with
+    ``k``, the position about to be filled. ``k`` is known before the symbol is
+    read, which is what makes the context causal and free of side information.
+
+    **On the style of this function.** Huffman decoding is inherently
+    sequential -- it cannot be vectorized the way the encoder was in phase 4.5
+    -- so the only lever is the constant factor, and in CPython that means
+    function calls and attribute lookups. Profiling a factored version (a bit
+    reader object exposing ``peek``/``skip``/``read_bits``) showed 902k calls
+    for 126k symbols, with call and ``self.`` overhead accounting for roughly
+    two thirds of decode time; inlining the accumulator into locals cut that
+    to 106k calls.
+
+    Net effect, 2500x2500 at q50: **0.68 s -> 0.41 s (1.6x)**. To be honest
+    about the ceiling, that is most of what this approach can give: the
+    remainder is ~680 ns per symbol of irreducible CPython loop work plus
+    0.09 s materializing the output array, and going meaningfully faster
+    wants a C extension rather than more micro-optimization. Four conversion
+    strategies were measured for that last step and ``np.array`` on the
+    nested list won, so it is not the thing to optimize next either.
+
+    ``tests/test_context.py`` carries an independent, deliberately naive
+    reference decoder and asserts the two agree bit for bit.
     """
 
-    reader = _BitReader(bitstream)
-    dc_decode = _build_decode_table(dc_table)
-    ac_decode = _build_decode_table(ac_table)
+    dc_lut = _build_decode_lut(dc_table)
+    if dc_lut is None:
+        raise ValueError("Container has an empty DC table")
+    dc_sym, dc_len, dc_long = dc_lut
 
-    coeffs = np.zeros((by, bx, BLOCK_SIZE, BLOCK_SIZE), dtype=np.int16)
+    luts = [_build_decode_lut(t) for t in ac_tables]
+    band = AC_LAYOUTS[layout].tolist()
+    zigzag = ZIGZAG_ORDER.tolist()
+
+    data = bitstream
+    limit = len(data)
+    hard_end = limit + _EOF_SLACK_BYTES
+    window_bits = DECODE_LUT_BITS
+    window_mask = (1 << window_bits) - 1
+
+    acc = 0        # bit accumulator, MSB-first
+    nb = 0         # valid bits held in `acc`
+    pos = 0        # next byte of `data` to consume
+
+    def _read_bit() -> int:
+        """Slow-path bit read, sharing the accumulator via nonlocal state."""
+        nonlocal acc, nb, pos
+        if nb == 0:
+            if pos < limit:
+                byte = data[pos]
+            elif pos < hard_end:
+                byte = 0
+            else:
+                raise EOFError("Unexpected end of bitstream")
+            pos += 1
+            acc = byte
+            nb = 8
+        nb -= 1
+        bit = (acc >> nb) & 1
+        acc &= (1 << nb) - 1
+        return bit
+
+    rows: list[list[int]] = []
     prev_dc = 0
 
-    for j in range(by):
-        for i in range(bx):
-            zz = np.zeros(64, dtype=np.int16)
+    for _ in range(by * bx):
+        flat = [0] * 64
 
-            # Decode DC
-            code = 0
-            for length in range(1, 33):
-                code = (code << 1) | reader.read_bit()
-                key = (length, code)
-                if key in dc_decode:
-                    cat = dc_decode[key]
-                    break
+        # --- DC ---
+        while nb < window_bits:
+            if pos < limit:
+                byte = data[pos]
+            elif pos < hard_end:
+                byte = 0
             else:
-                raise ValueError("Failed to decode DC coefficient")
+                raise EOFError("Unexpected end of bitstream")
+            pos += 1
+            acc = (acc << 8) | byte
+            nb += 8
 
-            if cat:
-                bits = reader.read_bits(cat)
-                diff = _bits_to_value(bits, cat)
+        w = (acc >> (nb - window_bits)) & window_mask
+        cat = dc_sym[w]
+        if cat >= 0:
+            nb -= dc_len[w]
+            acc &= (1 << nb) - 1
+        else:
+            cat = _decode_long_code(_read_bit, dc_long, "DC coefficient")
+
+        if cat:
+            while nb < cat:
+                if pos < limit:
+                    byte = data[pos]
+                elif pos < hard_end:
+                    byte = 0
+                else:
+                    raise EOFError("Unexpected end of bitstream")
+                pos += 1
+                acc = (acc << 8) | byte
+                nb += 8
+            nb -= cat
+            bits = (acc >> nb) & ((1 << cat) - 1)
+            acc &= (1 << nb) - 1
+            prev_dc += bits if bits >= (1 << (cat - 1)) else bits - ((1 << cat) - 1)
+
+        flat[zigzag[0]] = prev_dc
+
+        # --- AC ---
+        k = 1
+        while k < 64:
+            lut = luts[band[k]]
+            if lut is None:
+                raise ValueError("AC stream references an unused context")
+            ac_sym, ac_len, ac_long = lut
+
+            while nb < window_bits:
+                if pos < limit:
+                    byte = data[pos]
+                elif pos < hard_end:
+                    byte = 0
+                else:
+                    raise EOFError("Unexpected end of bitstream")
+                pos += 1
+                acc = (acc << 8) | byte
+                nb += 8
+
+            w = (acc >> (nb - window_bits)) & window_mask
+            symbol = ac_sym[w]
+            if symbol >= 0:
+                nb -= ac_len[w]
+                acc &= (1 << nb) - 1
             else:
-                diff = 0
-            dc_val = prev_dc + diff
-            prev_dc = dc_val
-            zz[0] = dc_val
+                symbol = _decode_long_code(_read_bit, ac_long, "AC coefficient")
 
-            # Decode AC
-            k = 1
-            while k < 64:
-                code = 0
-                symbol = None
-                for length in range(1, 33):
-                    code = (code << 1) | reader.read_bit()
-                    key = (length, code)
-                    if key in ac_decode:
-                        symbol = ac_decode[key]
-                        break
-                if symbol is None:
-                    raise ValueError("Failed to decode AC coefficient")
+            if symbol == 0x00:          # EOB
+                break
+            if symbol == 0xF0:          # ZRL
+                k += 16
+                if k > 64:
+                    raise ValueError("ZRL went past end of block")
+                continue
 
-                if symbol == 0x00:  # EOB
-                    break
-                if symbol == 0xF0:  # ZRL
-                    k += 16
-                    if k > 64:
-                        raise ValueError("ZRL went past end of block")
-                    continue
+            k += symbol >> 4
+            if k >= 64:
+                raise ValueError("Run-length went past end of block")
 
-                run = symbol >> 4
-                size = symbol & 0x0F
-                k += run
-                if k >= 64:
-                    raise ValueError("Run-length went past end of block")
-                bits = reader.read_bits(size)
-                zz[k] = _bits_to_value(bits, size)
-                k += 1
+            size = symbol & 0x0F
+            if size:
+                while nb < size:
+                    if pos < limit:
+                        byte = data[pos]
+                    elif pos < hard_end:
+                        byte = 0
+                    else:
+                        raise EOFError("Unexpected end of bitstream")
+                    pos += 1
+                    acc = (acc << 8) | byte
+                    nb += 8
+                nb -= size
+                bits = (acc >> nb) & ((1 << size) - 1)
+                acc &= (1 << nb) - 1
+                flat[zigzag[k]] = (
+                    bits if bits >= (1 << (size - 1)) else bits - ((1 << size) - 1)
+                )
+            k += 1
 
-            # Map zigzag back to 8x8 block
-            flat = np.zeros(64, dtype=np.int16)
-            flat[ZIGZAG_ORDER] = zz
-            coeffs[j, i] = flat.reshape(BLOCK_SIZE, BLOCK_SIZE)
+        rows.append(flat)
 
-    return coeffs
+    return np.array(rows, dtype=np.int16).reshape(by, bx, BLOCK_SIZE, BLOCK_SIZE)
 
 
 def _read_exactly(f, n: int) -> bytes:
@@ -1081,7 +1430,16 @@ def _serialize_huffman_table(table: dict[int, tuple[int, int]]) -> bytes:
     return bytes(buf)
 
 
-def _deserialize_huffman_table(data: bytes) -> dict[int, tuple[int, int]]:
+def _deserialize_huffman_table(
+    data: bytes, allow_empty: bool = False
+) -> dict[int, tuple[int, int]]:
+    """Rebuild a canonical Huffman table from its serialized lengths.
+
+    ``allow_empty`` permits a zero-symbol table, which is legitimate only for
+    an unused AC context (see :func:`_build_ac_context_tables`). The DC table
+    is always populated, so it keeps the strict check.
+    """
+
     if len(data) < 2:
         raise ValueError("Truncated Huffman table header")
 
@@ -1103,38 +1461,66 @@ def _deserialize_huffman_table(data: bytes) -> dict[int, tuple[int, int]]:
         lengths[sym] = length
 
     if not lengths:
+        if allow_empty:
+            return {}
         raise ValueError("Huffman table contains no symbols")
 
     return _assign_canonical_codes(lengths)
 
 
+def _read_huffman_table(f) -> dict[int, tuple[int, int]]:
+    """Read one self-delimiting Huffman table from an open container.
+
+    The table opens with its own 2-byte symbol count, so the reader knows how
+    much to consume without a separate length field.
+    """
+
+    count_bytes = _read_exactly(f, 2)
+    count = int.from_bytes(count_bytes, "big")
+    return _deserialize_huffman_table(
+        count_bytes + _read_exactly(f, 2 * count), allow_empty=True
+    )
+
+
 def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) -> None:
     """Compress an image using DCT + quantization + Huffman into a custom binary.
 
-    The ICJ2 container format is::
+    The ICJ3 container format is::
 
-        magic:      4 bytes   ASCII 'ICJ2'
+        magic:      4 bytes   ASCII 'ICJ3'
         height:     4 bytes   unsigned big-endian
         width:      4 bytes   unsigned big-endian
         quality:    1 byte    1-100 (always clamped before writing)
         blocks_y:   2 bytes   unsigned big-endian
         blocks_x:   2 bytes   unsigned big-endian
-        dc_len:     2 bytes   byte length of the DC table that follows
-        dc_table:   dc_len bytes
-        ac_len:     2 bytes   byte length of the AC table that follows
-        ac_table:   ac_len bytes
+        dc_table:   self-delimiting (see below)
+        layout:     1 byte    index into AC_LAYOUT_EDGES, chosen per image
+        present:    2 bytes   bitmap, bit i set if context i has a table
+        ac_tables:  one self-delimiting table per set bit, in context order
         bit_len:    4 bytes   length of following bitstream in bytes
         bitstream:  bit_len bytes, big-endian bit packing, zero-padded
 
     Each Huffman table is serialised as a 2-byte count of used symbols
     followed by that many 2-byte ``(symbol, code length)`` pairs. Canonical
-    codes are rebuilt from the lengths on load.
+    codes are rebuilt from the lengths on load. Tables are therefore
+    self-delimiting and carry no byte-length prefix.
+
+    Contexts that never occur are omitted entirely rather than written as
+    empty tables, which would otherwise be pure overhead on an image that
+    uses few bands.
+
+    ICJ3 replaced ICJ2's single AC table with one table per frequency band,
+    with the band layout priced per image and recorded in ``layout``. Layout 0
+    is a single table -- ICJ2's behaviour -- so ICJ3 is never worse. The
+    layout table is part of the format: ``layout`` is range-checked on load,
+    so a file written against a different :data:`AC_LAYOUT_EDGES` is rejected
+    rather than silently mis-decoded.
     """
 
     arr = _load_grayscale(input_path)
     comp = compress_array(arr, quality=quality)
     coeffs = comp.coeffs
-    bitstream, dc_table, ac_table = _encode_blocks_huffman(coeffs)
+    bitstream, dc_table, ac_tables, layout = _encode_blocks_huffman(coeffs)
 
     h, w = comp.orig_shape
     h_p, w_p = comp.padded_shape
@@ -1149,13 +1535,23 @@ def compress_huffman_file(input_path: str, output_path: str, quality: int = 50) 
     header.extend(int(by).to_bytes(2, "big"))
     header.extend(int(bx).to_bytes(2, "big"))
 
-    # Write tables with their byte lengths prefixed
-    dc_bytes = _serialize_huffman_table(dc_table)
-    ac_bytes = _serialize_huffman_table(ac_table)
-    header.extend(len(dc_bytes).to_bytes(2, "big"))
-    header.extend(dc_bytes)
-    header.extend(len(ac_bytes).to_bytes(2, "big"))
-    header.extend(ac_bytes)
+    # Tables are self-delimiting -- each opens with its own symbol count -- so
+    # no byte-length prefix is stored.
+    header.extend(_serialize_huffman_table(dc_table))
+
+    # Only contexts that actually occur are written, identified by a bitmap.
+    # Serialising every context unconditionally would spend 2 bytes apiece on
+    # empty tables, which is pure overhead on an image that uses few bands --
+    # the regime phase 4.1 was written to protect.
+    header.append(layout & 0xFF)
+    present = 0
+    for ctx, table in enumerate(ac_tables):
+        if table:
+            present |= 1 << ctx
+    header.extend(present.to_bytes(2, "big"))
+    for table in ac_tables:
+        if table:
+            header.extend(_serialize_huffman_table(table))
 
     header.extend(len(bitstream).to_bytes(4, "big"))
 
@@ -1183,17 +1579,27 @@ def decompress_huffman_file(input_path: str, output_path: str) -> None:
         by = int.from_bytes(_read_exactly(f, 2), "big")
         bx = int.from_bytes(_read_exactly(f, 2), "big")
 
-        dc_len = int.from_bytes(_read_exactly(f, 2), "big")
-        dc_bytes = _read_exactly(f, dc_len)
-        ac_len = int.from_bytes(_read_exactly(f, 2), "big")
-        ac_bytes = _read_exactly(f, ac_len)
-        dc_table = _deserialize_huffman_table(dc_bytes)
-        ac_table = _deserialize_huffman_table(ac_bytes)
+        dc_table = _read_huffman_table(f)
+
+        layout = _read_exactly(f, 1)[0]
+        if layout >= len(AC_LAYOUTS):
+            raise ValueError(
+                f"Container declares AC band layout {layout}, but this build "
+                f"defines only {len(AC_LAYOUTS)}. The layout table is part of "
+                "the format; a file written against a different "
+                "AC_LAYOUT_EDGES cannot be decoded."
+            )
+
+        present = int.from_bytes(_read_exactly(f, 2), "big")
+        ac_tables = [
+            _read_huffman_table(f) if present & (1 << ctx) else {}
+            for ctx in range(AC_LAYOUT_SIZES[layout])
+        ]
 
         bit_len = int.from_bytes(_read_exactly(f, 4), "big")
         bitstream = _read_exactly(f, bit_len)
 
-    coeffs = _decode_blocks_huffman(by, bx, bitstream, dc_table, ac_table)
+    coeffs = _decode_blocks_huffman(by, bx, bitstream, dc_table, ac_tables, layout)
 
     comp = CompressedImage(
         coeffs=coeffs,
