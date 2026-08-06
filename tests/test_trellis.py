@@ -52,6 +52,22 @@ def _rd_savings(img, probe_qualities, sweep=range(10, 96, 5)):
     return out
 
 
+def _plain_at_same_quantizer(img, quality):
+    """Plain quantization using the SAME internal quantizer trellis will use.
+
+    Since the quality dial was recalibrated, ``trellis=True`` and
+    ``trellis=False`` at one requested quality deliberately use *different*
+    quantizers -- both aim at the same JPEG-equivalent appearance, and only
+    the trellis path needs correcting. Comparing the DP's output against
+    plain rounding therefore has to pin the quantizer explicitly, or it
+    compares two different encodes and proves nothing.
+    """
+
+    return c.compress_array(
+        img, quality=c._calibrate_quality(quality, True), trellis=False
+    ).coeffs
+
+
 # --- Invariants -------------------------------------------------------------
 
 
@@ -59,7 +75,7 @@ def _rd_savings(img, probe_qualities, sweep=range(10, 96, 5)):
 def test_trellis_only_shrinks_magnitudes(photo, quality):
     """The DP may zero or step a level down, never up or across zero."""
 
-    base = c.compress_array(photo, quality=quality, trellis=False).coeffs
+    base = _plain_at_same_quantizer(photo, quality)
     tre = c.compress_array(photo, quality=quality, trellis=True).coeffs
 
     assert np.all(np.abs(tre) <= np.abs(base)), "a magnitude increased"
@@ -69,7 +85,7 @@ def test_trellis_only_shrinks_magnitudes(photo, quality):
 
 @pytest.mark.parametrize("quality", [10, 50, 90])
 def test_trellis_leaves_dc_alone(photo, quality):
-    base = c.compress_array(photo, quality=quality, trellis=False).coeffs
+    base = _plain_at_same_quantizer(photo, quality)
     tre = c.compress_array(photo, quality=quality, trellis=True).coeffs
     np.testing.assert_array_equal(tre[:, :, 0, 0], base[:, :, 0, 0])
 
@@ -101,7 +117,7 @@ def test_trellis_disabled_matches_plain_quantization(photo):
 
 def test_trellis_reduces_rate(photo):
     for q in (30, 50, 75):
-        base = c.compress_array(photo, quality=q, trellis=False).coeffs
+        base = _plain_at_same_quantizer(photo, q)
         tre = c.compress_array(photo, quality=q, trellis=True).coeffs
         assert _rate(tre) < _rate(base), f"trellis did not reduce rate at q={q}"
 
@@ -167,12 +183,14 @@ def test_trellis_iterations_is_a_knob_with_a_real_cost(photo):
     plain = c.compress_array(photo, quality=50, trellis=False)
     none = c.compress_array(photo, quality=50, trellis_iterations=0)
     assert np.array_equal(none.coeffs, plain.coeffs), (
-        "zero iterations must reproduce plain quantization exactly"
+        "zero iterations must reproduce plain quantization exactly, including "
+        "skipping the quality calibration"
     )
 
+    base = _plain_at_same_quantizer(photo, 50)
     one = c.compress_array(photo, quality=50, trellis_iterations=1)
     two = c.compress_array(photo, quality=50, trellis_iterations=2)
-    assert _rate(one.coeffs) < _rate(plain.coeffs)
+    assert _rate(one.coeffs) < _rate(base)
     assert _rate(two.coeffs) <= _rate(one.coeffs)
 
 
@@ -210,7 +228,9 @@ def test_rd_scoring_requires_a_monotone_curve():
     original = c.TRELLIS_LAMBDA_SCALE
     c.TRELLIS_LAMBDA_SCALE = 1e-9
     try:
-        base = c.compress_array(smooth, quality=40, trellis=False).coeffs
+        # Pin the quantizer: the calibrated dial means trellis=True at q40
+        # encodes at a finer internal quality than trellis=False would.
+        base = _plain_at_same_quantizer(smooth, 40)
         tre = c.compress_array(smooth, quality=40, trellis=True).coeffs
     finally:
         c.TRELLIS_LAMBDA_SCALE = original
@@ -246,3 +266,75 @@ def test_trellis_needs_no_format_change(tmp_path, photo):
     recon = np.array(Image.open(out), dtype=np.uint8)
     assert recon.shape == photo.shape
     assert _psnr(recon, photo) > 25
+
+
+# --- Quality calibration -----------------------------------------------------
+
+
+def test_calibration_is_monotone_and_bounded():
+    """The dial must stay ordered and in range, or quality stops being a dial."""
+
+    mapped = [c._calibrate_quality(q, True) for q in range(1, 101)]
+    assert mapped == sorted(mapped), "calibration must be non-decreasing"
+    assert min(mapped) >= 1 and max(mapped) <= 100
+    assert c._calibrate_quality(100, True) == 100
+
+
+def test_calibration_only_applies_when_trellis_runs():
+    """Plain quantization already matches libjpeg's scale, so must not move.
+
+    Correcting it would break the one case that was right before the fix.
+    """
+
+    for q in (1, 10, 50, 90, 100):
+        assert c._calibrate_quality(q, False) == q
+
+
+def test_calibration_raises_the_internal_quality():
+    """Trellis costs quality at a fixed quantizer, so the fix must compensate up.
+
+    A calibration that lowered the internal quality would be correcting in the
+    wrong direction and would make the original bug worse.
+    """
+
+    for q in (20, 30, 50, 70):
+        assert c._calibrate_quality(q, True) > q
+
+
+def test_zero_iterations_skips_calibration(photo):
+    """trellis_iterations=0 runs no DP, so it must not be compensated either."""
+
+    plain = c.compress_array(photo, quality=50, trellis=False)
+    none = c.compress_array(photo, quality=50, trellis_iterations=0)
+    assert none.quality == plain.quality == 50
+
+
+def test_calibrated_quality_tracks_libjpeg(photo):
+    """The point of the whole exercise: q50 must *look like* libjpeg q50.
+
+    Before calibration this codec's q50 measured 1.27 dB below libjpeg's on
+    kodim01 and ~18 quality points below on the Kodak set. Every check in the
+    suite was BD-rate, which integrates over the curve and is invariant to
+    exactly this shift -- so nothing caught it for three phases. This test is
+    the one that would have.
+    """
+
+    import io
+
+    from PIL import Image
+
+    for quality in (30, 50, 70):
+        recon = c.decompress_to_array(c.compress_array(photo, quality=quality))
+        ours = _psnr(recon, photo)
+
+        buf = io.BytesIO()
+        Image.fromarray(photo, mode="L").save(
+            buf, format="JPEG", quality=quality, optimize=True
+        )
+        with Image.open(io.BytesIO(buf.getvalue())) as im:
+            theirs = _psnr(np.array(im.convert("L")), photo)
+
+        assert ours > theirs - 0.5, (
+            f"q{quality}: {ours:.2f} dB vs libjpeg's {theirs:.2f} dB -- the "
+            "quality dial has drifted below what its number promises"
+        )

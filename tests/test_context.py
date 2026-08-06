@@ -383,6 +383,7 @@ def test_quantizer_output_is_unchanged_by_context_coding(photo):
         comp = c.compress_array(photo, quality=quality)
         recon = c.decompress_to_array(comp)
         mse = float(np.mean((recon.astype(np.float64) - photo.astype(np.float64)) ** 2))
-        # These are the phase 4.2 values, unchanged by phase 7.
-        expected = {10: 381.9600, 50: 88.0864, 90: 7.4462}[quality]
+        # Phase 7 left these untouched; they moved only when the quality
+        # dial was recalibrated, which changes the quantizer by design.
+        expected = {10: 270.0701, 50: 52.1434, 90: 6.3798}[quality]
         assert mse == pytest.approx(expected, abs=1e-4)

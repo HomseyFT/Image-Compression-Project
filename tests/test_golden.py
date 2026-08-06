@@ -47,22 +47,26 @@ import compression as c
 # counts are unchanged to the last digit, because the quantizer output is
 # byte-identical and only the coding of it improved.
 #
+# Re-pinned again after the quality dial was recalibrated. Trellis slides down
+# the R-D curve at a fixed quantizer, so an uncorrected q50 looked like
+# libjpeg q31; requested quality is now a JPEG-equivalent target mapped to a
+# finer internal quality (q10 -> 22, q50 -> 65, q90 -> 91). Rate and MSE both
+# move because the quantizer moved -- this pin is not comparable to the ones
+# above, which were taken on the uncalibrated scale.
+#
 # CAVEAT: these are *payload* bytes, and on this 256x256 fixture payload alone
 # is misleading. The encoder picks the AC band layout that minimises payload
-# PLUS tables, so it will happily spend payload bytes to save more in tables.
-# At q50 it chooses 5 bands (7510 B payload) over 15 bands (7348 B payload),
-# because the coarser split saves 370 B of tables -- a 208 B net win that a
-# payload-only pin reads as a 162 B regression. Whole-file rate is what
-# `bench` and `test_bench.py` score; this pin exists to catch *unintended*
-# drift, so read a change here alongside the BD-rate gate, not on its own.
+# PLUS tables, so it will happily spend payload bytes to save more in tables:
+# a coarser split can cost payload while saving more in table bytes, which a
+# payload-only pin reads as a regression. Whole-file rate is what `bench` and
+# `test_bench.py` score; this pin exists to catch *unintended* drift, so read
+# a change here alongside the BD-rate gate, not on its own.
 #
-# At q10 the fixture falls back to layout 0 (a single table) and reproduces
-# the phase 4.2 value exactly -- the "ICJ3 is never worse than ICJ2" property
-# showing up as a pin that did not move.
+# Layouts chosen at these pins: 3 bands at q10, 5 at q50 and q90.
 GOLDEN = {
-    10: (2152, 381.9600, 3364),
-    50: (7510, 88.0864, 11101),
-    90: (20437, 7.4462, 28499),
+    10: (3325, 270.0701, 4693),
+    50: (9811, 52.1434, 14430),
+    90: (21305, 6.3798, 29564),
 }
 
 RATE_TOLERANCE = 0.0  # exact; float32 is deterministic for a given numpy build
