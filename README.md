@@ -44,19 +44,50 @@ icjview photo.icj                      # or: python icjview.py photo.icj
 icjview photo.icj --info               # dimensions, size, ratio, sampling
 icjview a.png b.icj --compare          # side by side, equal size
 icjview photo.icj --color mono         # force ASCII
+icjview photo.icj --render sextant     # force a rendering path
 ```
 
-Rendering uses the Unicode upper-half block `▀`: the glyph's foreground paints
-the top half of the cell and its background the bottom, so one character
-carries **two** vertically stacked pixels. That's how `viu` and `chafa` work,
-and it needs nothing but plain ANSI escapes — no sixel, no kitty protocol.
-Since character cells are about twice as tall as they are wide, one pixel per
-column and two per row keeps the aspect ratio right with no correction factor.
+Rendering is **detected, not assumed**, on two independent axes.
 
-Colour depth is **detected, not assumed** — 24-bit if the terminal advertises
-it, else the 256-color cube, else ASCII. Piping to a file or a non-TTY falls
-back to ASCII automatically, and `NO_COLOR` is honoured, so redirected output
-never gets escape soup injected into it.
+**Transmission.** Terminals that speak a graphics protocol get real pixels:
+kitty (also Ghostty and WezTerm) and iTerm2. There the picture is limited by
+the window rather than the character grid — an 80×24 terminal is a 160×48
+sub-cell canvas but well over 1000×700 actual pixels, so this is roughly a
+10× resolution gain and is the difference between "pixelated" and "a photo".
+
+Everything else falls back to sub-cell glyphs: quadrants (`▚`, 2×2 pixels per
+cell) by default, sextants (2×3, Unicode 13) on request, half-blocks (`▀`,
+1×2) for older fonts, then ASCII. Quadrants rather than sextants by default is
+a font-coverage call — a missing glyph looks worse than a coarser one.
+Override any of it with `--render {auto,kitty,iterm,sextant,quadrant,blocks,
+ascii}`.
+
+**Colour depth.** 24-bit if the terminal advertises it, else the 256-color
+cube, else ASCII. Piping to a file or a non-TTY falls back to ASCII
+automatically, and `NO_COLOR` is honoured, so redirected output never gets
+escape soup injected into it. `--render` and `--color` are orthogonal: one
+picks how pixels are transmitted, the other how many colours are available.
+
+Two things the viewer gets right that are easy to get wrong, and that it
+originally got wrong: the xterm-256 cube is **not** linear — its levels are
+0/95/135/175/215/255 — and resampling happens in **linear light**, because
+averaging gamma-encoded values darkens exactly the detail-dense regions a
+large downscale is made of. Both are measured, not asserted: `bench/
+viewer_quality.py` scores a render in CIEDE2000 against a linear-light
+reference, and the fixes are gated on it.
+
+Measured on the 11-image corpus at 80×24 cells (mean CIEDE2000, lower is
+better; ~1.0 is the just-noticeable threshold):
+
+| path | ΔE00 |
+|---|---|
+| quadrant, 256-colour | 10.84 |
+| half-block, truecolor | 5.93 |
+| sextant, truecolor | 5.45 |
+| **kitty** | **0.00** |
+
+At 80×24 the kitty box is larger than a Kodak image, so the picture is sent
+unresampled — the character grid stops being the limit at all.
 
 ```
 $ icjview kodim03.icj --info --color mono
